@@ -87,7 +87,7 @@ class LaneletError(RuntimeError):
 
 def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0),
                      robust: bool = False, use_local_coordinates: bool = False,
-                     recenter: bool = False) -> LaneletMap:
+                     recenter: bool = False, projector: Optional[Any] = None) -> LaneletMap:
     """
     Load a Lanelet2 map from an OSM file on disk.
 
@@ -99,7 +99,8 @@ def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0),
             zone is selected; the default (0, 0) only works for maps whose
             coordinates are already centered near the equator/prime meridian.
             Ignored when ``use_local_coordinates`` is used and all nodes carry
-            ``local_x``/``local_y`` tags.
+            ``local_x``/``local_y`` tags, or when an explicit ``projector`` is
+            passed with its own origin.
         robust: if True, use ``loadRobust`` so that primitives the upstream
             parser cannot interpret (such as Autoware-specific regulatory
             elements like ``detection_area`` or ``virtual_traffic_light``) are
@@ -111,10 +112,17 @@ def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0),
             does: the geo-referenced lat/lon is only used to pick the UTM zone,
             while the authoritative planar coordinates come from the local tags.
             Falls back to the plain UTM projection for any node lacking them.
+            Because Autoware writes the MGRS-projected values into those tags,
+            this yields the same coordinates as Autoware's ``MGRSProjector``
+            without needing the native ``lanelet2_extension_python`` build.
         recenter: subtract the mean node position so the map is centered on the
             origin. Useful with ``use_local_coordinates`` because Autoware local
             coordinates are large MGRS-relative offsets (tens of thousands of
             metres) that hurt float precision and camera placement.
+        projector: an explicit lanelet2 projector to use instead of the default
+            UTM projector. Pass Autoware's projector here when it is available,
+            e.g. ``from lanelet2_extension_python.projection import MGRSProjector;
+            load_lanelet_map(path, projector=MGRSProjector(Origin(lat, lon)))``.
     Raises:
         Lanelet2NotFound: if lanelet2 package is not available
         FileNotFoundError: if specified file doesn't exist
@@ -123,7 +131,8 @@ def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0),
         raise Lanelet2NotFound()
     if not os.path.exists(map_path):
         raise FileNotFoundError(map_path)
-    projector = lanelet2.projection.UtmProjector(lanelet2.io.Origin(*origin))
+    if projector is None:
+        projector = lanelet2.projection.UtmProjector(lanelet2.io.Origin(*origin))
     if robust or use_local_coordinates:
         lanelet_map, load_errors = lanelet2.io.loadRobust(map_path, projector)
         if load_errors:

@@ -125,13 +125,24 @@ def run(cfg: AWSIMTrafficConfig):
     device = cfg.device
     torch.manual_seed(0)
 
-    # 1) Load the AWSIM/Autoware map the way Autoware itself does: the geo origin
-    #    only selects the UTM zone, while the authoritative planar coordinates
-    #    come from the local_x/local_y node tags (equivalent to Autoware's MGRS
-    #    projector). recenter=True brings the large MGRS offsets back to origin.
+    # 1) Load the AWSIM/Autoware map with Autoware's projector semantics.
+    #    Prefer the real MGRS projector from lanelet2_extension_python when it is
+    #    installed (as in a full Autoware environment). Where it is not available
+    #    (e.g. a plain pip install), fall back to reading the local_x/local_y node
+    #    tags, into which Autoware has already written the MGRS-projected values -
+    #    so the resulting coordinates are identical. recenter=True brings the
+    #    large MGRS offsets back to the origin for rendering/precision.
     origin = map_latlon_origin(cfg.map_path)
-    lanelet_map = load_lanelet_map(cfg.map_path, origin=origin, robust=True,
-                                   use_local_coordinates=True, recenter=True)
+    try:
+        from lanelet2_extension_python.projection import MGRSProjector
+        projector = MGRSProjector(lanelet2.io.Origin(*origin))
+        lanelet_map = load_lanelet_map(cfg.map_path, robust=True, recenter=True,
+                                       projector=projector)
+        print("[map] using Autoware MGRSProjector (lanelet2_extension_python)")
+    except ImportError:
+        lanelet_map = load_lanelet_map(cfg.map_path, origin=origin, robust=True,
+                                       use_local_coordinates=True, recenter=True)
+        print("[map] lanelet2_extension_python not found; using equivalent local_x/local_y")
     print(f"[map] {cfg.map_path} origin={origin} lanelets={len(list(lanelet_map.laneletLayer))}")
 
     # 2) Driving-surface mesh.
