@@ -85,13 +85,23 @@ class LaneletError(RuntimeError):
     pass
 
 
-def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0)) -> LaneletMap:
+def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0),
+                     robust: bool = False) -> LaneletMap:
     """
     Load a Lanelet2 map from an OSM file on disk.
 
     Args:
         map_path: local path to OSM file containing the map
-        origin: latitude and longitude of the origin to use with UTM projector
+        origin: latitude and longitude of the origin to use with UTM projector.
+            For geo-referenced maps (e.g. AWSIM/Autoware exports around a real
+            location), set this to a point inside the map so the correct UTM
+            zone is selected; the default (0, 0) only works for maps whose
+            coordinates are already centered near the equator/prime meridian.
+        robust: if True, use ``loadRobust`` so that primitives the upstream
+            parser cannot interpret (such as Autoware-specific regulatory
+            elements like ``detection_area`` or ``virtual_traffic_light``) are
+            skipped instead of aborting the whole load. The road/lane geometry
+            is still loaded, which is what TorchDriveSim needs.
     Raises:
         Lanelet2NotFound: if lanelet2 package is not available
         FileNotFoundError: if specified file doesn't exist
@@ -101,7 +111,12 @@ def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0)) -> Lan
     if not os.path.exists(map_path):
         raise FileNotFoundError(map_path)
     projector = lanelet2.projection.UtmProjector(lanelet2.io.Origin(*origin))
-    lanelet_map = lanelet2.io.load(map_path, projector)
+    if robust:
+        lanelet_map, load_errors = lanelet2.io.loadRobust(map_path, projector)
+        if load_errors:
+            logger.debug(f"load_lanelet_map skipped {len(load_errors)} unparsable primitive(s) in {map_path}")
+    else:
+        lanelet_map = lanelet2.io.load(map_path, projector)
     return lanelet_map
 
 
