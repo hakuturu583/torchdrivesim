@@ -125,9 +125,13 @@ def run(cfg: AWSIMTrafficConfig):
     device = cfg.device
     torch.manual_seed(0)
 
-    # 1) Robust, correctly-projected load of the AWSIM/Autoware map.
+    # 1) Load the AWSIM/Autoware map the way Autoware itself does: the geo origin
+    #    only selects the UTM zone, while the authoritative planar coordinates
+    #    come from the local_x/local_y node tags (equivalent to Autoware's MGRS
+    #    projector). recenter=True brings the large MGRS offsets back to origin.
     origin = map_latlon_origin(cfg.map_path)
-    lanelet_map = load_lanelet_map(cfg.map_path, origin=origin, robust=True)
+    lanelet_map = load_lanelet_map(cfg.map_path, origin=origin, robust=True,
+                                   use_local_coordinates=True, recenter=True)
     print(f"[map] {cfg.map_path} origin={origin} lanelets={len(list(lanelet_map.laneletLayer))}")
 
     # 2) Driving-surface mesh.
