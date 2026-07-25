@@ -30,6 +30,7 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 
 from awsim_rl_env import AWSIMDrivingEnv
+from awsim_hetero_rl_env import AWSIMHeteroDrivingEnv
 from awsim_lanelet2_traffic import save_video
 
 
@@ -56,6 +57,7 @@ class PPOConfig:
     hidden: int = 128
     seed: int = 42
     smoke_test: bool = False
+    hetero: bool = False  # train mixed vehicle/motorcycle/cyclist/pedestrian agents
 
 
 class ActorCritic(nn.Module):
@@ -112,14 +114,16 @@ def compute_gae(rewards, values, dones, last_value, gamma, lam):
 
 def train(cfg: PPOConfig):
     if cfg.smoke_test:
-        cfg.updates, cfg.rollout_steps, cfg.num_agents = 5, 128, 6
+        cfg.updates, cfg.rollout_steps = 5, 128
+        cfg.num_agents = 12 if cfg.hetero else 6
     os.makedirs(cfg.save_dir, exist_ok=True)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     dev = cfg.device
 
-    env = AWSIMDrivingEnv(cfg.map_path, num_agents=cfg.num_agents, max_steps=cfg.max_steps,
-                          dt=cfg.dt, device=dev, seed=cfg.seed)
+    env_cls = AWSIMHeteroDrivingEnv if cfg.hetero else AWSIMDrivingEnv
+    env = env_cls(cfg.map_path, num_agents=cfg.num_agents, max_steps=cfg.max_steps,
+                  dt=cfg.dt, device=dev, seed=cfg.seed)
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(od, ad, cfg.hidden).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, eps=1e-8)
@@ -218,6 +222,9 @@ def train(cfg: PPOConfig):
     video = save_video(frames, cfg.save_dir, "awsim_rl_rollout", cfg.dt, "mp4")
     print(f"[done] policy -> {os.path.join(cfg.save_dir, 'policy.pt')}")
     print(f"[done] rollout video -> {video}  (final reached {info['reached']:.2f})")
+    per_type = {k: v for k, v in info.items() if k.startswith('reached_')}
+    if per_type:
+        print("[done] per-type reached: " + ", ".join(f"{k[8:]} {v:.2f}" for k, v in per_type.items()))
 
 
 if __name__ == '__main__':
