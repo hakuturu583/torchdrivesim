@@ -20,11 +20,18 @@ that break the stock loader, both handled here:
 Autoware uses a right-handed ENU frame, so - unlike the CARLA maps - the map is
 NOT inverted and lane markings are built with ``left_handed=False``.
 
-Get a map first, e.g. the Autoware sample map (same VMB dialect as AWSIM):
+Get a map first. The actual AWSIM Quick Start map (Nishi-Shinjuku, ~1.1 x 1.1 km):
+    curl -L -o nishishinjuku_autoware_map.zip \\
+      https://github.com/tier4/AWSIM/releases/download/v1.1.0/nishishinjuku_autoware_map.zip
+    unzip nishishinjuku_autoware_map.zip
+    # -> nishishinjuku_autoware_map/lanelet2_map.osm
+
+    python examples/awsim_lanelet2_traffic.py \\
+        map_path=nishishinjuku_autoware_map/lanelet2_map.osm fov=340
+
+Or a small Autoware sample intersection (same VMB dialect, quick to render):
     curl -L -o sample_map.osm \\
       https://raw.githubusercontent.com/tier4/autoware_lanelet2_map_validator/main/autoware_lanelet2_map_validator/test/data/map/sample_map.osm
-
-Then run:
     python examples/awsim_lanelet2_traffic.py map_path=sample_map.osm
 """
 import os
