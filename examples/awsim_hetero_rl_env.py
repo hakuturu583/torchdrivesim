@@ -39,20 +39,22 @@ from awsim_lanelet2_traffic import (
     map_latlon_origin, build_driving_surface_mesh, build_route, _attr,
 )
 
-# type -> kinematic family, size, turn radius, top speed, spawn surface, goal distance, colour
+# type -> kinematic family, size, turn radius, top speed, lanelet2 participant,
+# goal distance, colour. The participant selects which lanelets the type may
+# spawn/route on (via traffic_rules.canPass) and which routing graph is used,
+# so Autoware participant tags + subtypes are honoured directly.
 TYPES = ["vehicle", "motorcycle", "cyclist", "pedestrian"]
 TYPE_SPEC = {
-    "vehicle":    dict(model=0, size=(4.97, 2.04), lr=1.96, vmax=14.0, surface="road", goal_dist=45.0, color=(32, 74, 135)),
-    "motorcycle": dict(model=0, size=(2.20, 0.90), lr=0.80, vmax=18.0, surface="road", goal_dist=45.0, color=(230, 90, 20)),
-    "cyclist":    dict(model=0, size=(1.80, 0.70), lr=0.60, vmax=6.0,  surface="bike", goal_dist=30.0, color=(24, 104, 225)),
-    "pedestrian": dict(model=1, size=(0.70, 0.70), lr=0.50, vmax=2.0,  surface="walk", goal_dist=None, color=(173, 127, 168)),
+    "vehicle":    dict(model=0, size=(4.97, 2.04), lr=1.96, vmax=14.0, participant="vehicle",    goal_dist=45.0, color=(32, 74, 135)),
+    "motorcycle": dict(model=0, size=(2.20, 0.90), lr=0.80, vmax=18.0, participant="motorcycle", goal_dist=45.0, color=(230, 90, 20)),
+    "cyclist":    dict(model=0, size=(1.80, 0.70), lr=0.60, vmax=6.0,  participant="bicycle",     goal_dist=30.0, color=(24, 104, 225)),
+    "pedestrian": dict(model=1, size=(0.70, 0.70), lr=0.50, vmax=2.0,  participant="pedestrian",  goal_dist=None, color=(173, 127, 168)),
 }
 DEFAULT_MIX = {"vehicle": 0.4, "motorcycle": 0.15, "cyclist": 0.15, "pedestrian": 0.3}
-# which lanelet subtypes each spawn surface may use (first non-empty wins in order)
-SURFACE_SUBTYPES = {
-    "road": [("road",)],
-    "bike": [("road_shoulder", "road")],  # cyclists may use shoulders and the road
-    "walk": [("crosswalk", "walkway"), ("road_shoulder",)],
+# lanelet2 Participants used per participant key (with graceful fallback to Vehicle)
+PARTICIPANT_ENUM = {
+    "vehicle": "Vehicle", "motorcycle": "VehicleMotorcycle",
+    "bicycle": "Bicycle", "pedestrian": "Pedestrian",
 }
 
 
@@ -128,42 +130,50 @@ class AWSIMHeteroDrivingEnv:
             counts["vehicle"] += 1
         return counts
 
-    def _lanelets_of(self, subtypes):
-        lls = sorted([l for l in self.lanelet_map.laneletLayer if _attr(l, 'subtype') in subtypes],
-                     key=lambda l: l.id)
+    def _traffic_rules(self, participant_key):
+        """traffic_rules for a participant key, falling back to Vehicle if unsupported."""
+        name = PARTICIPANT_ENUM.get(participant_key, "Vehicle")
+        for candidate in (name, "Vehicle"):
+            try:
+                return lanelet2.traffic_rules.create(Locations.Germany, getattr(Participants, candidate))
+            except Exception:
+                continue
+        return lanelet2.traffic_rules.create(Locations.Germany, Participants.Vehicle)
+
+    def _passable_lanelets(self, rules):
+        lls = sorted([l for l in self.lanelet_map.laneletLayer if rules.canPass(l)], key=lambda l: l.id)
         if len(lls) > self.pool_cap:
             idx = sorted(self._rng.choice(len(lls), self.pool_cap, replace=False))
             lls = [lls[i] for i in idx]
         return lls
 
     def _build_spawn_pools(self):
-        """One route polyline pool per spawn surface, built once."""
-        rules = lanelet2.traffic_rules.create(Locations.Germany, Participants.Vehicle)
-        graph = lanelet2.routing.RoutingGraph(self.lanelet_map, rules)
+        """One route-polyline pool per participant, built once from that
+        participant's traffic rules (canPass) and routing graph."""
+        participants = {TYPE_SPEC[t]["participant"] for t in TYPES}
         self._pools = {}
-        for surface, subtype_groups in SURFACE_SUBTYPES.items():
+        for pkey in participants:
+            rules = self._traffic_rules(pkey)
+            graph = lanelet2.routing.RoutingGraph(self.lanelet_map, rules)
             polys = []
-            for subtypes in subtype_groups:  # fall back to the next group if empty
-                lls = self._lanelets_of(subtypes)
-                for ll in lls:
-                    if surface == "walk":  # pedestrians just cross a single lanelet
-                        poly = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64)
-                    else:                    # wheeled agents follow a downstream route
-                        poly = build_route(graph, ll)
-                    if poly.shape[0] >= 2 and _polyline_length(poly) > 3.0:
-                        polys.append(poly)
-                if polys:
-                    break
-            if not polys:  # last-ditch fallback: use road routes
-                polys = self._pools.get("road", [])
-            self._pools[surface] = polys
+            for ll in self._passable_lanelets(rules):
+                if pkey == "pedestrian":  # pedestrians cross a single lanelet
+                    poly = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64)
+                else:                      # wheeled agents follow a legal downstream route
+                    poly = build_route(graph, ll)
+                if poly.shape[0] >= 2 and _polyline_length(poly) > 3.0:
+                    polys.append(poly)
+            self._pools[pkey] = polys
+        for pkey in participants:  # any empty pool falls back to the vehicle network
+            if not self._pools[pkey]:
+                self._pools[pkey] = self._pools.get("vehicle", [])
 
     def _sample_spawns(self):
         placed = []  # (x, y, radius)
         starts, headings, goals = [], [], []
         for tidx in self.agent_type_idx:
             spec = TYPE_SPEC[TYPES[tidx]]
-            pool = self._pools[spec["surface"]] or self._pools["road"]
+            pool = self._pools[spec["participant"]] or self._pools["vehicle"]
             L, W = spec["size"]
             radius = 0.5 * max(L, W) + self.spawn_gap
             chosen = None
