@@ -61,18 +61,28 @@ class PPOConfig:
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden=128):
+    """GPUDrive / Nocturne-style actor-critic: separate ego and neighbour
+    encoders, with the neighbours max-pooled (permutation-invariant deep-sets)
+    so a variable, unordered set of nearby agents is handled cleanly."""
+
+    def __init__(self, ego_dim, max_partners, partner_features, act_dim, hidden=128):
         super().__init__()
-        self.body = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-        )
+        self.ego_dim = ego_dim
+        self.max_partners = max_partners
+        self.partner_features = partner_features
+        self.ego_enc = nn.Sequential(nn.Linear(ego_dim, hidden), nn.Tanh())
+        self.partner_enc = nn.Sequential(nn.Linear(partner_features, hidden), nn.Tanh())
+        self.trunk = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.Tanh())
         self.mean = nn.Linear(hidden, act_dim)
         self.log_std = nn.Parameter(-0.5 * torch.ones(act_dim))
         self.value = nn.Linear(hidden, 1)
 
     def forward(self, obs):
-        h = self.body(obs)
+        ego = obs[:, :self.ego_dim]
+        partners = obs[:, self.ego_dim:].view(obs.shape[0], self.max_partners, self.partner_features)
+        e = self.ego_enc(ego)
+        p = self.partner_enc(partners).max(dim=1).values  # deep-sets max-pool over neighbours
+        h = self.trunk(torch.cat([e, p], dim=-1))
         mean = self.mean(h)
         return mean, self.log_std.expand_as(mean), self.value(h).squeeze(-1)
 
@@ -126,7 +136,7 @@ def train(cfg: PPOConfig):
     env = env_cls(cfg.map_path, num_agents=cfg.num_agents, max_steps=cfg.max_steps,
                   dt=cfg.dt, device=dev, seed=cfg.seed)
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
-    net = ActorCritic(od, ad, cfg.hidden).to(dev)
+    net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES, ad, cfg.hidden).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, eps=1e-8)
 
     obs = env.reset()

@@ -30,10 +30,22 @@ from lanelet2.traffic_rules import Locations, Participants
 
 
 class AWSIMDrivingEnv:
-    """Vectorised (num_agents parallel streams) driving env on one AWSIM map."""
+    """Vectorised (num_agents parallel streams) driving env on one AWSIM map.
 
-    OBS_DIM = 8
+    Each agent observes its own ego state + goal AND its nearest neighbours, using
+    the GPUDrive / Nocturne recipe: per-neighbour features in the ego frame
+    (rel position, size, rel heading, signed speed), gathered for the K closest
+    agents within a view radius and zero-padded. The policy encodes neighbours
+    with a shared MLP and max-pools them (permutation-invariant), so the agent
+    can see and react to others rather than only being punished after a collision.
+    """
+
     ACT_DIM = 2
+    EGO_DIM = 8               # ego features (speed, goal, prev action)
+    MAX_PARTNERS = 8          # K nearest neighbours observed
+    PARTNER_FEATURES = 7      # rel_x, rel_y, width, length, rel_head_cos/sin, rel_speed
+    VIEW_RADIUS = 30.0        # metres; neighbours beyond this are not observed
+    OBS_DIM = EGO_DIM + MAX_PARTNERS * PARTNER_FEATURES
 
     def __init__(self, map_path, num_agents=8, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, render_fov=None, render_res=512, seed=0):
@@ -76,13 +88,13 @@ class AWSIMDrivingEnv:
         self._init_state[0, :, 2] = torch.tensor(headings, dtype=torch.float32)
 
         self.agent_length, self.agent_width, self.lr = 4.97, 2.04, 1.96
+        self.agent_size = torch.tensor([self.agent_length, self.agent_width], device=device
+                                       ).view(1, 1, 2).expand(1, num_agents, 2).contiguous()
         self._build_simulator()
         self.reset()
 
     def _build_simulator(self):
         A = self.num_agents
-        agent_size = torch.tensor([self.agent_length, self.agent_width], device=self.device)
-        agent_size = agent_size.view(1, 1, 2).expand(1, A, 2).contiguous()
         kin = KinematicBicycle(dt=self.dt)
         kin.set_params(lr=torch.full((1, A), self.lr, device=self.device))
         kin.set_state(self._init_state.clone())
@@ -90,7 +102,7 @@ class AWSIMDrivingEnv:
                                renderer=RendererConfig(left_handed_coordinates=False))
         self.renderer = renderer_from_config(cfg.renderer)
         self.simulator = Simulator(
-            cfg=cfg, road_mesh=self.mesh, kinematic_model=kin, agent_size=agent_size,
+            cfg=cfg, road_mesh=self.mesh, kinematic_model=kin, agent_size=self.agent_size,
             initial_present_mask=torch.ones(1, A, dtype=torch.bool, device=self.device),
             renderer=self.renderer, lanelet_map=[self.lanelet_map],
         )
@@ -103,6 +115,12 @@ class AWSIMDrivingEnv:
         return torch.linalg.norm(state[:, :2] - self.goals, dim=-1)  # (A,)
 
     def _observation(self, state, prev_action):
+        # [A, EGO_DIM | MAX_PARTNERS * PARTNER_FEATURES], consumed by a policy that
+        # slices off the ego part and max-pools the reshaped partner part.
+        return torch.cat([self._ego_features(state, prev_action),
+                          self._partner_block(state)], dim=-1)
+
+    def _ego_features(self, state, prev_action):
         x, y, psi, v = state[:, 0], state[:, 1], state[:, 2], state[:, 3]
         dx, dy = self.goals[:, 0] - x, self.goals[:, 1] - y
         c, s = torch.cos(psi), torch.sin(psi)
@@ -110,14 +128,50 @@ class AWSIMDrivingEnv:
         gy_e = -s * dx + c * dy
         dist = torch.linalg.norm(torch.stack([dx, dy], -1), dim=-1)
         head_err = torch.atan2(gy_e, gx_e)
-        obs = torch.stack([
+        return torch.stack([
             v / 10.0,
             dist.clamp(max=100.0) / 50.0,
             torch.cos(head_err), torch.sin(head_err),
             (gx_e / 50.0).clamp(-2, 2), (gy_e / 50.0).clamp(-2, 2),
             prev_action[:, 0], prev_action[:, 1],
         ], dim=-1)
-        return obs
+
+    def _partner_extra(self, nidx, valid):
+        """Optional extra per-neighbour features (e.g. type one-hot). None in base."""
+        return None
+
+    def _partner_block(self, state):
+        """GPUDrive-style neighbour observation: for each agent, the K nearest
+        others within VIEW_RADIUS, in the ego frame, zero-padded. Returns
+        [A, MAX_PARTNERS * PARTNER_FEATURES]."""
+        A = state.shape[0]
+        K = self.MAX_PARTNERS
+        out = torch.zeros(A, K, self.PARTNER_FEATURES, device=self.device)
+        k = min(K, A - 1)
+        if k > 0:
+            xy, psi, v = state[:, :2], state[:, 2], state[:, 3]
+            dx = xy[:, 0][None, :] - xy[:, 0][:, None]          # [A, A] (j - i)
+            dy = xy[:, 1][None, :] - xy[:, 1][:, None]
+            dist2 = dx * dx + dy * dy
+            dist2.fill_diagonal_(float('inf'))                  # ignore self
+            nd, nidx = torch.topk(dist2, k, dim=1, largest=False)  # [A, k]
+            valid = nd < self.VIEW_RADIUS ** 2
+            c, s = torch.cos(psi)[:, None], torch.sin(psi)[:, None]
+            gdx = torch.gather(dx, 1, nidx); gdy = torch.gather(dy, 1, nidx)
+            rel_x = (c * gdx + s * gdy) / self.VIEW_RADIUS
+            rel_y = (-s * gdx + c * gdy) / self.VIEW_RADIUS
+            rel_h = psi[nidx] - psi[:, None]
+            wj = self.agent_size[0, :, 1][nidx] / 3.0
+            lj = self.agent_size[0, :, 0][nidx] / 6.0
+            vj = v[nidx] / 10.0
+            feat = torch.stack([rel_x, rel_y, wj, lj,
+                                torch.cos(rel_h), torch.sin(rel_h), vj], dim=-1)  # [A, k, 7]
+            extra = self._partner_extra(nidx, valid)
+            if extra is not None:
+                feat = torch.cat([feat, extra], dim=-1)
+            feat = feat * valid[..., None]                      # zero out far/empty slots
+            out[:, :k, :] = feat
+        return out.reshape(A, -1)
 
     # Hooks so subclasses (e.g. the heterogeneous env) can extend reset/step
     # without duplicating their bodies.

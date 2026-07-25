@@ -57,8 +57,10 @@ PARTICIPANT_ENUM = {
 
 
 class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
-    OBS_DIM = 8 + len(TYPES)  # base features + one-hot type
-    ACT_DIM = 4               # superset action (bicycle uses [:2], pedestrian [:4])
+    ACT_DIM = 4                              # superset action (bicycle uses [:2], pedestrian [:4])
+    EGO_DIM = AWSIMDrivingEnv.EGO_DIM + len(TYPES)              # ego features + own type one-hot
+    PARTNER_FEATURES = AWSIMDrivingEnv.PARTNER_FEATURES + len(TYPES)  # + neighbour type one-hot
+    OBS_DIM = EGO_DIM + AWSIMDrivingEnv.MAX_PARTNERS * PARTNER_FEATURES
 
     def __init__(self, map_path, num_agents=12, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, mix=None, render_fov=None, render_res=512, seed=0,
@@ -212,9 +214,11 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
     def _prepare_reset(self):
         self._sample_spawns()  # re-randomise spawns every episode
 
-    def _observation(self, state, prev_action):
-        base = super()._observation(state, prev_action)
-        return torch.cat([base, self.type_onehot], dim=-1)
+    def _ego_features(self, state, prev_action):  # append own type one-hot
+        return torch.cat([super()._ego_features(state, prev_action), self.type_onehot], dim=-1)
+
+    def _partner_extra(self, nidx, valid):        # append each neighbour's type one-hot
+        return self.type_onehot[nidx]
 
     def _post_physics(self):
         state = self._state()
