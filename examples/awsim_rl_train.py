@@ -73,7 +73,8 @@ class ActorCritic(nn.Module):
 
     def forward(self, obs):
         h = self.body(obs)
-        return self.mean(h), self.log_std.expand_as(self.mean(h)), self.value(h).squeeze(-1)
+        mean = self.mean(h)
+        return mean, self.log_std.expand_as(mean), self.value(h).squeeze(-1)
 
     def act(self, obs, deterministic=False):
         mean, log_std, value = self(obs)
@@ -100,8 +101,8 @@ class ActorCritic(nn.Module):
 
 def compute_gae(rewards, values, dones, last_value, gamma, lam):
     T, A = rewards.shape
-    adv = torch.zeros(T, A)
-    last_gae = torch.zeros(A)
+    adv = torch.zeros(T, A, device=rewards.device)
+    last_gae = torch.zeros(A, device=rewards.device)
     for t in reversed(range(T)):
         next_value = last_value if t == T - 1 else values[t + 1]
         next_nonterminal = 1.0 - dones[t]
@@ -156,9 +157,7 @@ def train(cfg: PPOConfig):
 
         with torch.no_grad():
             last_value = net(obs)[2]
-        adv, returns = compute_gae(b_rew.cpu(), b_val.cpu(), b_done.cpu(), last_value.cpu(),
-                                   cfg.gamma, cfg.gae_lambda)
-        adv, returns = adv.to(dev), returns.to(dev)
+        adv, returns = compute_gae(b_rew, b_val, b_done, last_value, cfg.gamma, cfg.gae_lambda)
 
         f_obs = b_obs.reshape(-1, od)
         f_act = b_act.reshape(-1, ad)

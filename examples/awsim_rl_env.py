@@ -13,7 +13,6 @@ acceleration, steering, both in [-1, 1]), so no mixed-model machinery is
 needed and the whole batch of agents advances in one TorchDriveSim step.
 Rendering is only used when saving a video, so rollouts stay fast on CPU.
 """
-import math
 import numpy as np
 import torch
 
@@ -23,7 +22,7 @@ from torchdrivesim.simulator import TorchDriveConfig, Simulator
 from torchdrivesim.utils import Resolution
 
 from awsim_lanelet2_traffic import (
-    map_latlon_origin, build_driving_surface_mesh, build_route, _attr, save_video,
+    map_latlon_origin, build_driving_surface_mesh, build_route, _attr, mesh_camera,
 )
 from torchdrivesim.lanelet2 import load_lanelet_map
 import lanelet2
@@ -51,10 +50,8 @@ class AWSIMDrivingEnv:
         self.lanelet_map = load_lanelet_map(map_path, origin=origin, robust=True,
                                             use_local_coordinates=True, recenter=True)
         self.mesh = build_driving_surface_mesh(self.lanelet_map).to(device)
-        vx, vy = self.mesh.verts[..., 0], self.mesh.verts[..., 1]
-        self._center = (float((vx.min() + vx.max()) / 2), float((vy.min() + vy.max()) / 2))
-        self.render_fov = render_fov if render_fov is not None else \
-            1.1 * max(float(vx.max() - vx.min()), float(vy.max() - vy.min()))
+        self._center, default_fov = mesh_camera(self.mesh)
+        self.render_fov = render_fov if render_fov is not None else default_fov
 
         # --- lane-following routes -> start states + goals ---
         rules = lanelet2.traffic_rules.create(Locations.Germany, Participants.Vehicle)
@@ -122,7 +119,19 @@ class AWSIMDrivingEnv:
         ], dim=-1)
         return obs
 
+    # Hooks so subclasses (e.g. the heterogeneous env) can extend reset/step
+    # without duplicating their bodies.
+    def _prepare_reset(self):
+        """Called at the start of reset(); override to re-sample spawns etc."""
+
+    def _post_physics(self):
+        """Called after simulator.step(); override e.g. to clamp per-type speed."""
+
+    def _augment_info(self, info):
+        """Called at the end of step(); override to add extra info entries."""
+
     def reset(self):
+        self._prepare_reset()
         self._build_simulator()
         self._t = 0
         self._prev_action = torch.zeros(self.num_agents, self.ACT_DIM, device=self.device)
@@ -134,6 +143,7 @@ class AWSIMDrivingEnv:
     def step(self, action):
         action = torch.as_tensor(action, dtype=torch.float32, device=self.device).clamp(-1, 1)
         self.simulator.step(action.unsqueeze(0))
+        self._post_physics()
         self._t += 1
         state = self._state()
         dist = self._dist_to_goal(state)
@@ -154,6 +164,7 @@ class AWSIMDrivingEnv:
             'collision': float(collision.mean()),
             'offroad': float(offroad.mean()),
         }
+        self._augment_info(info)
         return self._observation(state, action), reward, done, info
 
     # --------------------------------------------------------------- render

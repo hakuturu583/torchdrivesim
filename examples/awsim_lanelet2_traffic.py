@@ -37,7 +37,6 @@ Or a small Autoware sample intersection (same VMB dialect, quick to render):
 import os
 import re
 import sys
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -109,6 +108,32 @@ def build_driving_surface_mesh(lanelet_map):
     return lane_mesh.merge(road_mesh)
 
 
+def mesh_camera(mesh, fov_scale=1.1):
+    """(center_xy, fov) that frames the whole driving-surface mesh."""
+    vx, vy = mesh.verts[..., 0], mesh.verts[..., 1]
+    center = (float((vx.min() + vx.max()) / 2), float((vy.min() + vy.max()) / 2))
+    fov = fov_scale * max(float(vx.max() - vx.min()), float(vy.max() - vy.min()))
+    return center, fov
+
+
+def polyline_cumlen(polyline):
+    """Segment vectors, segment lengths and cumulative arc-length of a polyline."""
+    seg = np.diff(polyline, axis=0)
+    seglen = np.hypot(seg[:, 0], seg[:, 1])
+    cum = np.concatenate([[0.0], np.cumsum(seglen)])
+    return seg, seglen, cum
+
+
+def point_at_arclen(polyline, s, cache=None):
+    """(x, y, heading) at arc-length s; pass cache=polyline_cumlen(poly) to avoid recompute."""
+    seg, seglen, cum = cache if cache is not None else polyline_cumlen(polyline)
+    s = float(np.clip(s, 0.0, cum[-1]))
+    i = max(0, min(int(np.searchsorted(cum, s) - 1), len(seg) - 1))
+    r = (s - cum[i]) / max(seglen[i], 1e-6)
+    x, y = polyline[i] + r * seg[i]
+    return x, y, float(np.arctan2(seg[i, 1], seg[i, 0]))
+
+
 def build_route(graph, start, max_lanelets=14, max_len=260.0):
     """Chain following lanelets into a route and return its densified centerline."""
     chain, seen, total, cur = [start], {start.id}, 0.0, start
@@ -131,18 +156,10 @@ def build_route(graph, start, max_lanelets=14, max_len=260.0):
 
 def resample_route(polyline, speed, dt, steps):
     """(steps+1, 3) array of (x, y, heading) advancing at constant speed along a polyline."""
-    seg = np.diff(polyline, axis=0)
-    seglen = np.hypot(seg[:, 0], seg[:, 1])
-    cum = np.concatenate([[0.0], np.cumsum(seglen)])
-    total = float(cum[-1])
-    out = []
-    for k in range(steps + 1):
-        d = min(k * speed * dt, total - 1e-3)
-        i = max(0, min(int(np.searchsorted(cum, d) - 1), len(seg) - 1))
-        r = (d - cum[i]) / max(seglen[i], 1e-6)
-        x, y = polyline[i] + r * seg[i]
-        out.append((x, y, math.atan2(seg[i, 1], seg[i, 0])))
-    return np.asarray(out)
+    cache = polyline_cumlen(polyline)
+    total = float(cache[2][-1])
+    return np.asarray([point_at_arclen(polyline, min(k * speed * dt, total - 1e-3), cache)
+                       for k in range(steps + 1)])
 
 
 def run(cfg: AWSIMTrafficConfig):
@@ -209,9 +226,8 @@ def run(cfg: AWSIMTrafficConfig):
         renderer=renderer, lanelet_map=[lanelet_map],
     )
 
-    vx, vy = mesh.verts[..., 0], mesh.verts[..., 1]
-    camera_xy = torch.tensor([[[float((vx.min() + vx.max()) / 2),
-                                float((vy.min() + vy.max()) / 2)]]], device=device)
+    center, _ = mesh_camera(mesh)
+    camera_xy = torch.tensor([[list(center)]], device=device)
     camera_psi = torch.zeros(1, 1, 1, device=device)
     res = Resolution(cfg.res, cfg.res)
 
