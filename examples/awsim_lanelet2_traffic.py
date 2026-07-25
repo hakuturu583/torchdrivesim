@@ -68,6 +68,24 @@ class AWSIMTrafficConfig:
     dt: float = 0.2
     res: int = 800
     fov: float = 170.0
+    video_format: str = "mp4"  # "mp4" (needs imageio-ffmpeg) or "gif"
+
+
+def save_video(frames, save_dir, name, dt, video_format="mp4"):
+    """Write frames to an mp4 (via imageio-ffmpeg) or gif. Falls back to gif on failure."""
+    fps = max(1, int(round(1.0 / max(dt, 1e-3))))
+    if video_format == "mp4":
+        path = os.path.join(save_dir, f"{name}.mp4")
+        try:
+            # macro_block_size=1 avoids forced resizing of odd frame dimensions.
+            imageio.mimwrite(path, frames, fps=fps, codec="libx264", macro_block_size=1,
+                             pixelformat="yuv420p")
+            return path
+        except Exception as exc:  # e.g. imageio-ffmpeg not installed
+            print(f"[video] mp4 writing failed ({exc}); falling back to gif")
+    path = os.path.join(save_dir, f"{name}.gif")
+    imageio.mimsave(path, frames, duration=dt, loop=0)
+    return path
 
 
 def _attr(lanelet, key, default=""):
@@ -209,10 +227,9 @@ def run(cfg: AWSIMTrafficConfig):
             nxt[0, :, 3] = torch.tensor(speeds, dtype=torch.float32)
             simulator.step(nxt)
 
-    gif_path = os.path.join(cfg.save_dir, "awsim_traffic.gif")
-    imageio.mimsave(gif_path, frames, duration=cfg.dt, loop=0)
+    video_path = save_video(frames, cfg.save_dir, "awsim_traffic", cfg.dt, cfg.video_format)
     imageio.imsave(os.path.join(cfg.save_dir, "awsim_map.png"), frames[0])
-    print(f"[sim] {cfg.steps} steps, {A} agents -> {gif_path}")
+    print(f"[sim] {cfg.steps} steps, {A} agents -> {video_path}")
     print(f"[metrics] max_collision={max_collision:.3f} max_offroad={max_offroad:.3f}")
 
 
