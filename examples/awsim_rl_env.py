@@ -45,7 +45,11 @@ class AWSIMDrivingEnv:
     MAX_PARTNERS = 8          # K nearest neighbours observed
     PARTNER_FEATURES = 7      # rel_x, rel_y, width, length, rel_head_cos/sin, rel_speed
     VIEW_RADIUS = 30.0        # metres; neighbours beyond this are not observed
-    OBS_DIM = EGO_DIM + MAX_PARTNERS * PARTNER_FEATURES
+    MAX_ROAD = 10             # K nearest road-graph points observed
+    ROAD_FEATURES = 4         # rel_x, rel_y, rel_dir_cos, rel_dir_sin
+    ROAD_RADIUS = 30.0        # metres; road points beyond this are not observed
+    ROAD_POINT_CAP = 2000     # subsample the lane-centreline point cloud to this many
+    OBS_DIM = EGO_DIM + MAX_PARTNERS * PARTNER_FEATURES + MAX_ROAD * ROAD_FEATURES
 
     def __init__(self, map_path, num_agents=8, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, render_fov=None, render_res=512, seed=0):
@@ -64,6 +68,7 @@ class AWSIMDrivingEnv:
         self.mesh = build_driving_surface_mesh(self.lanelet_map).to(device)
         self._center, default_fov = mesh_camera(self.mesh)
         self.render_fov = render_fov if render_fov is not None else default_fov
+        self._build_road_graph()
 
         # --- lane-following routes -> start states + goals ---
         rules = lanelet2.traffic_rules.create(Locations.Germany, Participants.Vehicle)
@@ -93,6 +98,23 @@ class AWSIMDrivingEnv:
         self._build_simulator()
         self.reset()
 
+    def _build_road_graph(self):
+        """Sample lane centrelines into a point cloud (x, y, heading) used for the
+        road-graph observation, mirroring GPUDrive's road-segment observations."""
+        xy, hdg = [], []
+        for ll in self.lanelet_map.laneletLayer:
+            pts = [(p.x, p.y) for p in ll.centerline]
+            for a, b in zip(pts[:-1], pts[1:]):
+                xy.append(a)
+                hdg.append(np.arctan2(b[1] - a[1], b[0] - a[0]))
+        xy = np.asarray(xy, dtype=np.float32)
+        hdg = np.asarray(hdg, dtype=np.float32)
+        if xy.shape[0] > self.ROAD_POINT_CAP:  # subsample to bound the nearest-point query
+            sel = self._rng.choice(xy.shape[0], self.ROAD_POINT_CAP, replace=False)
+            xy, hdg = xy[sel], hdg[sel]
+        self._road_xy = torch.tensor(xy, device=self.device)          # [M, 2]
+        self._road_dir = torch.tensor(hdg, device=self.device)        # [M]
+
     def _build_simulator(self):
         A = self.num_agents
         kin = KinematicBicycle(dt=self.dt)
@@ -115,10 +137,11 @@ class AWSIMDrivingEnv:
         return torch.linalg.norm(state[:, :2] - self.goals, dim=-1)  # (A,)
 
     def _observation(self, state, prev_action):
-        # [A, EGO_DIM | MAX_PARTNERS * PARTNER_FEATURES], consumed by a policy that
-        # slices off the ego part and max-pools the reshaped partner part.
+        # [A, EGO_DIM | MAX_PARTNERS*PARTNER_FEATURES | MAX_ROAD*ROAD_FEATURES];
+        # the policy slices off the ego part and max-pools the partner and road sets.
         return torch.cat([self._ego_features(state, prev_action),
-                          self._partner_block(state)], dim=-1)
+                          self._partner_block(state),
+                          self._road_block(state)], dim=-1)
 
     def _ego_features(self, state, prev_action):
         x, y, psi, v = state[:, 0], state[:, 1], state[:, 2], state[:, 3]
@@ -171,6 +194,31 @@ class AWSIMDrivingEnv:
                 feat = torch.cat([feat, extra], dim=-1)
             feat = feat * valid[..., None]                      # zero out far/empty slots
             out[:, :k, :] = feat
+        return out.reshape(A, -1)
+
+    def _road_block(self, state):
+        """GPUDrive-style road-graph observation: for each agent, the K nearest
+        lane-centreline points within ROAD_RADIUS, in the ego frame, zero-padded.
+        Returns [A, MAX_ROAD * ROAD_FEATURES]."""
+        A = state.shape[0]
+        K = self.MAX_ROAD
+        out = torch.zeros(A, K, self.ROAD_FEATURES, device=self.device)
+        M = self._road_xy.shape[0]
+        k = min(K, M)
+        if k > 0:
+            psi = state[:, 2]
+            dx = self._road_xy[:, 0][None, :] - state[:, 0][:, None]   # [A, M]
+            dy = self._road_xy[:, 1][None, :] - state[:, 1][:, None]
+            dist2 = dx * dx + dy * dy
+            nd, nidx = torch.topk(dist2, k, dim=1, largest=False)      # [A, k]
+            valid = nd < self.ROAD_RADIUS ** 2
+            c, s = torch.cos(psi)[:, None], torch.sin(psi)[:, None]
+            gdx = torch.gather(dx, 1, nidx); gdy = torch.gather(dy, 1, nidx)
+            rel_x = (c * gdx + s * gdy) / self.ROAD_RADIUS
+            rel_y = (-s * gdx + c * gdy) / self.ROAD_RADIUS
+            rel_dir = self._road_dir[nidx] - psi[:, None]
+            feat = torch.stack([rel_x, rel_y, torch.cos(rel_dir), torch.sin(rel_dir)], dim=-1)
+            out[:, :k, :] = feat * valid[..., None]
         return out.reshape(A, -1)
 
     # Hooks so subclasses (e.g. the heterogeneous env) can extend reset/step

@@ -60,7 +60,8 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
     ACT_DIM = 4                              # superset action (bicycle uses [:2], pedestrian [:4])
     EGO_DIM = AWSIMDrivingEnv.EGO_DIM + len(TYPES)              # ego features + own type one-hot
     PARTNER_FEATURES = AWSIMDrivingEnv.PARTNER_FEATURES + len(TYPES)  # + neighbour type one-hot
-    OBS_DIM = EGO_DIM + AWSIMDrivingEnv.MAX_PARTNERS * PARTNER_FEATURES
+    OBS_DIM = (EGO_DIM + AWSIMDrivingEnv.MAX_PARTNERS * PARTNER_FEATURES
+               + AWSIMDrivingEnv.MAX_ROAD * AWSIMDrivingEnv.ROAD_FEATURES)
 
     def __init__(self, map_path, num_agents=12, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, mix=None, render_fov=None, render_res=512, seed=0,
@@ -83,6 +84,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self.mesh = build_driving_surface_mesh(self.lanelet_map).to(device)
         self._center, default_fov = mesh_camera(self.mesh)
         self.render_fov = render_fov if render_fov is not None else default_fov
+        self._build_road_graph()
 
         # fixed per-agent type + derived static properties
         counts = self._allocate(num_agents, mix)
