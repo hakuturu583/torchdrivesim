@@ -58,6 +58,8 @@ class PPOConfig:
     seed: int = 42
     smoke_test: bool = False
     hetero: bool = False  # train mixed vehicle/motorcycle/cyclist/pedestrian agents
+    checkpoint_every: int = 0  # save policy_<update>.pt every N updates (0 = only final)
+    resume: str = ""           # path to a policy .pt to warm-start from
 
 
 class ActorCritic(nn.Module):
@@ -161,6 +163,9 @@ def train(cfg: PPOConfig):
                       env.MAX_ROAD, env.ROAD_FEATURES, ad, cfg.hidden,
                       num_types=env.NUM_TYPES, type_slice=env.TYPE_ONEHOT_SLICE).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, eps=1e-8)
+    if cfg.resume:
+        net.load_state_dict(torch.load(cfg.resume, map_location=dev))
+        print(f"[resume] loaded policy from {cfg.resume}")
 
     obs = env.reset()
     ep_return = torch.zeros(A, device=dev)
@@ -211,7 +216,7 @@ def train(cfg: PPOConfig):
         for _ in range(cfg.update_epochs):
             np.random.shuffle(active_idx)
             for start in range(0, N, mb):
-                j = active_idx[start:start + mb]
+                j = torch.as_tensor(active_idx[start:start + mb], device=dev)
                 new_logp, entropy, value = net.evaluate(f_obs[j], f_act[j])
                 ratio = (new_logp - f_logp[j]).exp()
                 pg1 = -f_adv[j] * ratio
@@ -230,7 +235,9 @@ def train(cfg: PPOConfig):
         history.append(mean_ret)
         print(f"upd {update+1:4d}/{cfg.updates} | return {mean_ret:8.3f} | "
               f"reached {info['reached']:.2f} coll {info['collision']:.2f} off {info['offroad']:.2f} | "
-              f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}")
+              f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
+        if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
+            torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))
 
     # save reward curve
     try:

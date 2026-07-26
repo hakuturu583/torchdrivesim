@@ -103,7 +103,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         sizes = np.stack([TYPE_SPEC[TYPES[t]]["size"] for t in self.agent_type_idx])
         self.agent_size = torch.tensor(sizes, dtype=torch.float32, device=device).unsqueeze(0)
         self.type_onehot = torch.zeros(num_agents, len(TYPES), device=device)
-        self.type_onehot[torch.arange(num_agents), self._type_idx_t] = 1.0
+        self.type_onehot[torch.arange(num_agents, device=device), self._type_idx_t] = 1.0
 
         self._build_spawn_pools()
         self.reset()
@@ -188,8 +188,8 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         A = self.num_agents
         self.goals = torch.tensor(np.stack(goals), dtype=torch.float32, device=self.device)
         self._init_state = torch.zeros(1, A, 4, device=self.device)
-        self._init_state[0, :, :2] = torch.tensor(np.stack(starts), dtype=torch.float32)
-        self._init_state[0, :, 2] = torch.tensor(np.stack(headings), dtype=torch.float32)
+        self._init_state[0, :, :2] = torch.tensor(np.stack(starts), dtype=torch.float32, device=self.device)
+        self._init_state[0, :, 2] = torch.tensor(np.stack(headings), dtype=torch.float32, device=self.device)
 
     def _build_simulator(self):
         A = self.num_agents

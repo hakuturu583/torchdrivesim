@@ -15,11 +15,10 @@ ready for **real GPU training**, which was intentionally left to the GPU operato
 
 ## Environment setup
 
-Python 3.11. Install (CPU here; on GPU use the matching CUDA torch):
+Python 3.11. Install the CUDA-matched `torch` first (see project README), then:
 
 ```bash
-pip install numpy scipy opencv-python-headless torch imageio lanelet2 \
-            omegaconf shapely imageio-ffmpeg matplotlib
+pip install -r examples/requirements-awsim.txt   # lanelet2, opencv, imageio-ffmpeg, ...
 ```
 
 - `lanelet2` (PyPI 1.2.3) provides the Python bindings — no ROS needed.
@@ -148,12 +147,21 @@ Full GPU training (the next step):
 ```bash
 python examples/awsim_rl_train.py hetero=true \
   map_path=nishishinjuku_autoware_map/lanelet2_map.osm \
-  device=cuda num_agents=64 updates=3000 rollout_steps=256
+  device=cuda num_agents=64 updates=3000 rollout_steps=256 \
+  checkpoint_every=100          # writes policy_<n>.pt; resume=<path> to warm-start
 ```
 Config knobs (OmegaConf dot-list): `updates, rollout_steps, num_agents, max_steps, dt,
 gamma, gae_lambda, clip_coef, ent_coef, vf_coef, lr, update_epochs, minibatches, hidden,
-seed, hetero, smoke_test`. Env knobs live in the env `__init__` (`mix`, `spawn_gap`,
-`pool_cap`, `goal_radius`, `MAX_PARTNERS`/`MAX_ROAD`/radii as class attrs).
+seed, hetero, smoke_test, checkpoint_every, resume`. Env knobs live in the env `__init__`
+(`mix`, `spawn_gap`, `pool_cap`, `goal_radius`, `MAX_PARTNERS`/`MAX_ROAD`/radii as class
+attrs). Progress prints are flushed, so `tail -f` works during long runs.
+
+The code is **device-correct for CUDA** (all env tensors carry `device=`, index tensors are
+on-device, GAE runs on the rollout device); verified on CPU, and audited for the CUDA path.
+Building the env on the full Shinjuku map takes **~60-70 s once** (four per-participant
+routing graphs + route pools + the road-point cloud); the per-step cost is small. On CPU
+the training bottleneck is the rollout; a GPU makes the deep-sets policy and larger
+`num_agents` practical.
 
 ## Current results (CPU, short runs — NOT converged)
 

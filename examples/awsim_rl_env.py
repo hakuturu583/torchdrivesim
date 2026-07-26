@@ -91,8 +91,8 @@ class AWSIMDrivingEnv:
         headings = np.stack([np.arctan2(*(r[1] - r[0])[::-1]) for r in routes])  # (A,)
         self.goals = torch.tensor(np.stack([r[-1] for r in routes]), dtype=torch.float32, device=device)
         self._init_state = torch.zeros(1, num_agents, 4, device=device)
-        self._init_state[0, :, :2] = torch.tensor(starts, dtype=torch.float32)
-        self._init_state[0, :, 2] = torch.tensor(headings, dtype=torch.float32)
+        self._init_state[0, :, :2] = torch.tensor(starts, dtype=torch.float32, device=device)
+        self._init_state[0, :, 2] = torch.tensor(headings, dtype=torch.float32, device=device)
 
         self.agent_length, self.agent_width, self.lr = 4.97, 2.04, 1.96
         self.agent_size = torch.tensor([self.agent_length, self.agent_width], device=device
