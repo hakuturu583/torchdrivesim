@@ -196,6 +196,9 @@ class AWSIMDrivingEnv:
 
     def step(self, action):
         action = torch.as_tensor(action, dtype=torch.float32, device=self.device).clamp(-1, 1)
+        was_reached = self._reached.clone()          # agents that already finished before this step
+        action = action.clone()
+        action[was_reached] = 0.0                     # finished agents take no action (stay put)
         self.simulator.step(action.unsqueeze(0))
         self._post_physics()
         self._t += 1
@@ -205,18 +208,27 @@ class AWSIMDrivingEnv:
         progress = (self._prev_dist - dist)                                   # dense shaping
         collision = (self.simulator.compute_collision()[0] > 0).float()
         offroad = (self.simulator.compute_offroad()[0] > 0).float()
-        newly_reached = (dist < self.goal_radius) & (~self._reached)
+        newly_reached = (dist < self.goal_radius) & (~was_reached)
         reward = progress - 0.5 * collision - 0.5 * offroad + 1.0 * newly_reached.float()
-        reward = torch.where(self._reached, torch.zeros_like(reward), reward)  # frozen agents get 0
+        reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
-        self._reached |= (dist < self.goal_radius)
+        self._reached = was_reached | (dist < self.goal_radius)
+        # Freeze finished agents in place so they stop moving and don't drift into others.
+        if self._reached.any():
+            frozen = state.clone(); frozen[self._reached, 3] = 0.0
+            self.simulator.set_state(frozen.unsqueeze(0), mask=self._reached.unsqueeze(0))
+            state = self._state()
         self._prev_dist = dist
         self._prev_action = action
         done = self._reached.clone() | (self._t >= self.max_steps)
+        # `active` marks transitions that count for training: an agent's steps are
+        # valid up to and including the step it reaches the goal, then excluded.
+        active = ~was_reached
         info = {
             'reached': float(self._reached.float().mean()),
-            'collision': float(collision.mean()),
-            'offroad': float(offroad.mean()),
+            'collision': float(collision[active].mean()) if bool(active.any()) else 0.0,
+            'offroad': float(offroad[active].mean()) if bool(active.any()) else 0.0,
+            'active': active,
         }
         self._augment_info(info)
         return self._observation(state, action), reward, done, info

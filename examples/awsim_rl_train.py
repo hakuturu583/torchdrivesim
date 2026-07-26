@@ -150,6 +150,7 @@ def train(cfg: PPOConfig):
         b_val = torch.zeros(cfg.rollout_steps, A, device=dev)
         b_rew = torch.zeros(cfg.rollout_steps, A, device=dev)
         b_done = torch.zeros(cfg.rollout_steps, A, device=dev)
+        b_active = torch.zeros(cfg.rollout_steps, A, device=dev)
         completed_returns = []
 
         for t in range(cfg.rollout_steps):
@@ -158,6 +159,7 @@ def train(cfg: PPOConfig):
             next_obs, reward, done, info = env.step(action)
             b_obs[t], b_act[t], b_logp[t], b_val[t] = obs, action, logp, value
             b_rew[t], b_done[t] = reward, done.float()
+            b_active[t] = info['active'].float()
             ep_return += reward
             obs = next_obs
             if bool(done.all()):  # episode boundary -> log and reset
@@ -174,16 +176,19 @@ def train(cfg: PPOConfig):
         f_logp = b_logp.reshape(-1)
         f_adv = adv.reshape(-1)
         f_ret = returns.reshape(-1)
-        f_adv = (f_adv - f_adv.mean()) / (f_adv.std() + 1e-8)
+        # Only train on transitions before each agent finished (post-goal steps excluded).
+        active_idx = b_active.reshape(-1).bool().nonzero(as_tuple=True)[0].cpu().numpy()
+        if active_idx.size == 0:
+            active_idx = np.arange(f_obs.shape[0])
+        f_adv = (f_adv - f_adv[active_idx].mean()) / (f_adv[active_idx].std() + 1e-8)
 
-        N = f_obs.shape[0]
+        N = active_idx.size
         mb = max(1, N // cfg.minibatches)
-        idx = np.arange(N)
         last_stats = (0.0, 0.0, 0.0)
         for _ in range(cfg.update_epochs):
-            np.random.shuffle(idx)
+            np.random.shuffle(active_idx)
             for start in range(0, N, mb):
-                j = idx[start:start + mb]
+                j = active_idx[start:start + mb]
                 new_logp, entropy, value = net.evaluate(f_obs[j], f_act[j])
                 ratio = (new_logp - f_logp[j]).exp()
                 pg1 = -f_adv[j] * ratio
