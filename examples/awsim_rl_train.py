@@ -60,6 +60,9 @@ class PPOConfig:
     hetero: bool = False  # train mixed vehicle/motorcycle/cyclist/pedestrian agents
     checkpoint_every: int = 0  # save policy_<update>.pt every N updates (0 = only final)
     resume: str = ""           # path to a policy .pt to warm-start from
+    wandb: bool = False        # log metrics to Weights & Biases
+    wandb_project: str = "awsim-rl"
+    wandb_run: str = ""        # optional run name
 
 
 class ActorCritic(nn.Module):
@@ -167,6 +170,12 @@ def train(cfg: PPOConfig):
         net.load_state_dict(torch.load(cfg.resume, map_location=dev))
         print(f"[resume] loaded policy from {cfg.resume}")
 
+    run = None
+    if cfg.wandb:
+        import wandb
+        run = wandb.init(project=cfg.wandb_project, name=(cfg.wandb_run or None),
+                         config=OmegaConf.to_container(cfg, resolve=True))
+
     obs = env.reset()
     ep_return = torch.zeros(A, device=dev)
     history = []
@@ -238,6 +247,13 @@ def train(cfg: PPOConfig):
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
             torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))
+        if run is not None:
+            metrics = {"return": mean_ret, "reached": info["reached"],
+                       "collision": info["collision"], "offroad": info["offroad"],
+                       "loss/policy": last_stats[0], "loss/value": last_stats[1],
+                       "entropy": last_stats[2]}
+            metrics.update({f"reached/{k[8:]}": v for k, v in info.items() if k.startswith("reached_")})
+            run.log(metrics, step=update)
 
     # save reward curve
     try:
@@ -269,6 +285,15 @@ def train(cfg: PPOConfig):
     per_type = {k: v for k, v in info.items() if k.startswith('reached_')}
     if per_type:
         print("[done] per-type reached: " + ", ".join(f"{k[8:]} {v:.2f}" for k, v in per_type.items()))
+
+    if run is not None:
+        import wandb
+        log = {"final/reached": info["reached"], "rollout": wandb.Video(video)}
+        curve = os.path.join(cfg.save_dir, "reward_curve.png")
+        if os.path.exists(curve):
+            log["reward_curve"] = wandb.Image(curve)
+        run.log(log)
+        run.finish()
 
 
 if __name__ == '__main__':

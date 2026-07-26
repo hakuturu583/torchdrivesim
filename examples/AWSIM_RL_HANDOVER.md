@@ -150,9 +150,18 @@ python examples/awsim_rl_train.py hetero=true \
   device=cuda num_agents=64 updates=3000 rollout_steps=256 \
   checkpoint_every=100          # writes policy_<n>.pt; resume=<path> to warm-start
 ```
+Metrics can go to **Weights & Biases** (`pip install wandb`):
+```bash
+python examples/awsim_rl_train.py hetero=true device=cuda ... \
+  wandb=true wandb_project=awsim-rl wandb_run=shinjuku-64a
+```
+It logs return, reached (overall + per type), collision, offroad and losses per update,
+and the final rollout video + reward curve. Disabled by default; `wandb` is only imported
+when `wandb=true`.
+
 Config knobs (OmegaConf dot-list): `updates, rollout_steps, num_agents, max_steps, dt,
 gamma, gae_lambda, clip_coef, ent_coef, vf_coef, lr, update_epochs, minibatches, hidden,
-seed, hetero, smoke_test, checkpoint_every, resume`. Env knobs live in the env `__init__`
+seed, hetero, smoke_test, checkpoint_every, resume, wandb, wandb_project, wandb_run`. Env knobs live in the env `__init__`
 (`mix`, `spawn_gap`, `pool_cap`, `goal_radius`, `MAX_PARTNERS`/`MAX_ROAD`/radii as class
 attrs). Progress prints are flushed, so `tail -f` works during long runs.
 
@@ -162,6 +171,16 @@ Building the env on the full Shinjuku map takes **~60-70 s once** (four per-part
 routing graphs + route pools + the road-point cloud); the per-step cost is small. On CPU
 the training bottleneck is the rollout; a GPU makes the deep-sets policy and larger
 `num_agents` practical.
+
+## Tests
+
+`tests/test_awsim_examples.py` — self-contained smoke tests (generate a tiny AWSIM-format
+map, no network): map load with local coords, base + hetero env construct/reset/step and
+obs dims, spawn re-randomisation, goal freeze + `active` mask, and a 2-update PPO run for
+both single- and multi-type policies. Run:
+```bash
+python -m pytest tests/test_awsim_examples.py -q     # 7 passed (~7 s)
+```
 
 ## Current results (CPU, short runs — NOT converged)
 
