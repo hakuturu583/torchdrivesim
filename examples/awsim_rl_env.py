@@ -50,6 +50,8 @@ class AWSIMDrivingEnv:
     ROAD_RADIUS = 30.0        # metres; road points beyond this are not observed
     ROAD_POINT_CAP = 2000     # subsample the lane-centreline point cloud to this many
     OBS_DIM = EGO_DIM + MAX_PARTNERS * PARTNER_FEATURES + MAX_ROAD * ROAD_FEATURES
+    NUM_TYPES = 1             # single agent type -> single policy head
+    TYPE_ONEHOT_SLICE = None  # (start, end) of the ego type one-hot in the obs, if any
 
     def __init__(self, map_path, num_agents=8, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, render_fov=None, render_res=512, seed=0):

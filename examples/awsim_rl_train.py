@@ -66,21 +66,25 @@ class ActorCritic(nn.Module):
     (permutation-invariant deep-sets) so variable, unordered sets are handled."""
 
     def __init__(self, ego_dim, max_partners, partner_features, max_road, road_features,
-                 act_dim, hidden=128):
+                 act_dim, hidden=128, num_types=1, type_slice=None):
         super().__init__()
         self.ego_dim = ego_dim
         self.max_partners, self.partner_features = max_partners, partner_features
         self.max_road, self.road_features = max_road, road_features
         self.partner_dim = max_partners * partner_features
+        self.num_types, self.type_slice = num_types, type_slice
         self.ego_enc = nn.Sequential(nn.Linear(ego_dim, hidden), nn.Tanh())
         self.partner_enc = nn.Sequential(nn.Linear(partner_features, hidden), nn.Tanh())
         self.road_enc = nn.Sequential(nn.Linear(road_features, hidden), nn.Tanh())
         self.trunk = nn.Sequential(nn.Linear(3 * hidden, hidden), nn.Tanh())
-        self.mean = nn.Linear(hidden, act_dim)
-        self.log_std = nn.Parameter(-0.5 * torch.ones(act_dim))
+        # One actor head (mean + log_std) per agent type; the value head is shared,
+        # since ego/partner/road perception is shared and only the action semantics
+        # differ per type (car steering vs. omnidirectional pedestrian, etc.).
+        self.mean = nn.ModuleList([nn.Linear(hidden, act_dim) for _ in range(num_types)])
+        self.log_std = nn.Parameter(-0.5 * torch.ones(num_types, act_dim))
         self.value = nn.Linear(hidden, 1)
 
-    def forward(self, obs):
+    def _trunk(self, obs):
         B = obs.shape[0]
         ego = obs[:, :self.ego_dim]
         partners = obs[:, self.ego_dim:self.ego_dim + self.partner_dim].view(
@@ -89,9 +93,19 @@ class ActorCritic(nn.Module):
         e = self.ego_enc(ego)
         p = self.partner_enc(partners).max(dim=1).values   # deep-sets max-pool over neighbours
         r = self.road_enc(road).max(dim=1).values           # deep-sets max-pool over road points
-        h = self.trunk(torch.cat([e, p, r], dim=-1))
-        mean = self.mean(h)
-        return mean, self.log_std.expand_as(mean), self.value(h).squeeze(-1)
+        return self.trunk(torch.cat([e, p, r], dim=-1))
+
+    def forward(self, obs):
+        h = self._trunk(obs)
+        if self.num_types == 1:
+            mean = self.mean[0](h)
+            log_std = self.log_std[0].expand_as(mean)
+        else:  # select each sample's per-type head using its ego type one-hot
+            tidx = obs[:, self.type_slice[0]:self.type_slice[1]].argmax(dim=1)  # [B]
+            means = torch.stack([head(h) for head in self.mean], dim=1)         # [B, T, act]
+            mean = means[torch.arange(h.shape[0], device=h.device), tidx]
+            log_std = self.log_std[tidx]
+        return mean, log_std, self.value(h).squeeze(-1)
 
     def act(self, obs, deterministic=False):
         mean, log_std, value = self(obs)
@@ -144,7 +158,8 @@ def train(cfg: PPOConfig):
                   dt=cfg.dt, device=dev, seed=cfg.seed)
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
-                      env.MAX_ROAD, env.ROAD_FEATURES, ad, cfg.hidden).to(dev)
+                      env.MAX_ROAD, env.ROAD_FEATURES, ad, cfg.hidden,
+                      num_types=env.NUM_TYPES, type_slice=env.TYPE_ONEHOT_SLICE).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, eps=1e-8)
 
     obs = env.reset()

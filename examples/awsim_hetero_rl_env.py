@@ -62,6 +62,9 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
     PARTNER_FEATURES = AWSIMDrivingEnv.PARTNER_FEATURES + len(TYPES)  # + neighbour type one-hot
     OBS_DIM = (EGO_DIM + AWSIMDrivingEnv.MAX_PARTNERS * PARTNER_FEATURES
                + AWSIMDrivingEnv.MAX_ROAD * AWSIMDrivingEnv.ROAD_FEATURES)
+    NUM_TYPES = len(TYPES)    # one policy head per road-user type
+    # the ego type one-hot sits right after the base ego features
+    TYPE_ONEHOT_SLICE = (AWSIMDrivingEnv.EGO_DIM, AWSIMDrivingEnv.EGO_DIM + len(TYPES))
 
     def __init__(self, map_path, num_agents=12, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, mix=None, render_fov=None, render_res=512, seed=0,
