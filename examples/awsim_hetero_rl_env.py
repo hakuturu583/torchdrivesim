@@ -12,7 +12,8 @@ inherited from the base env.
 
 Four types, two kinematic families (via CompoundKinematicModel):
     vehicle, motorcycle, cyclist  -> KinematicBicycle  (action = accel, steer)
-    pedestrian                    -> SimpleKinematicModel (omnidirectional)
+    pedestrian                    -> OrientedKinematicModel (omnidirectional,
+                                     body-frame action to match the ego-frame observation)
 
 Type-aware spawning: the spawn surface and routing graph are chosen per type
 from lanelet2 participant traffic rules (``canPass``), which honour Autoware
@@ -25,7 +26,8 @@ code is appended to each observation. Reward is shared (inherited from the base)
 import numpy as np
 import torch
 
-from torchdrivesim.kinematic import KinematicBicycle, SimpleKinematicModel, CompoundKinematicModel
+from torchdrivesim.kinematic import (KinematicBicycle, OrientedKinematicModel,
+                                     CompoundKinematicModel)
 from torchdrivesim.rendering import renderer_from_config, RendererConfig
 from torchdrivesim.simulator import TorchDriveConfig, Simulator
 from torchdrivesim.lanelet2 import load_lanelet_map
@@ -68,7 +70,12 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
 
     def __init__(self, map_path, num_agents=12, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, mix=None, render_fov=None, render_res=512, seed=0,
-                 spawn_attempts=25, spawn_gap=1.5, pool_cap=120):
+                 spawn_attempts=25, spawn_gap=1.5, pool_cap=120,
+                 w_progress=None, w_goal=None, w_offroad=None, w_collision=None):
+        self.w_progress = self.W_PROGRESS if w_progress is None else w_progress
+        self.w_goal = self.W_GOAL if w_goal is None else w_goal
+        self.w_offroad = self.W_OFFROAD if w_offroad is None else w_offroad
+        self.w_collision = self.W_COLLISION if w_collision is None else w_collision
         self.device = device
         self.num_agents = num_agents
         self.max_steps = max_steps
@@ -199,7 +206,12 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         bike = KinematicBicycle(dt=self.dt)
         bike.set_params(lr=self.lr_all[wheeled].clone())
         bike.set_state(self._init_state[0, wheeled].clone())
-        walk = SimpleKinematicModel(dt=self.dt, max_dx=TYPE_SPEC["pedestrian"]["vmax"])
+        # OrientedKinematicModel, not SimpleKinematicModel: the latter's action is the
+        # world-frame state gradient, but observations are purely ego-frame (the agent's
+        # own psi is not observable), so a pedestrian cannot work out which world
+        # direction its goal lies in. The oriented model rotates the action frame with the
+        # agent, matching the bicycle agents' body-frame actions.
+        walk = OrientedKinematicModel(dt=self.dt, max_dx=TYPE_SPEC["pedestrian"]["vmax"])
         walk.set_state(self._init_state[0, ped].clone())
         kin = CompoundKinematicModel([bike, walk], model_assignments=assign, dt=self.dt)
         # State/params are already on device, but each model's action `_normalization_factor`

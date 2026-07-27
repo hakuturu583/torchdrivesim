@@ -55,8 +55,24 @@ class AWSIMDrivingEnv:
     NUM_TYPES = 1             # single agent type -> single policy head
     TYPE_ONEHOT_SLICE = None  # (start, end) of the ego type one-hot in the obs, if any
 
+    # Reward weights. `progress` is measured in metres, so it sums to roughly the goal
+    # distance over a successful episode (~45 m for a vehicle): a goal bonus of 1.0 is
+    # then worth 2% of the return and the policy optimises "make progress", not "arrive".
+    # Likewise an offroad penalty has to outweigh the progress won by cutting a corner.
+    # Prefer scaling `progress` down over scaling the goal bonus up: the latter inflates
+    # the return scale, and with vf_coef=2.0 the value loss then dominates the gradient.
+    W_PROGRESS = 1.0
+    W_GOAL = 1.0
+    W_OFFROAD = 0.5
+    W_COLLISION = 0.5
+
     def __init__(self, map_path, num_agents=8, max_steps=80, dt=0.1, device='cpu',
-                 goal_radius=3.0, render_fov=None, render_res=512, seed=0):
+                 goal_radius=3.0, render_fov=None, render_res=512, seed=0,
+                 w_progress=None, w_goal=None, w_offroad=None, w_collision=None):
+        self.w_progress = self.W_PROGRESS if w_progress is None else w_progress
+        self.w_goal = self.W_GOAL if w_goal is None else w_goal
+        self.w_offroad = self.W_OFFROAD if w_offroad is None else w_offroad
+        self.w_collision = self.W_COLLISION if w_collision is None else w_collision
         self.device = device
         self.num_agents = num_agents
         self.max_steps = max_steps
@@ -327,7 +343,8 @@ class AWSIMDrivingEnv:
         collision = (self._collision(state) > 0).float()
         offroad = (self._offroad(state) > 0).float()
         newly_reached = (dist < self.goal_radius) & (~was_reached)
-        reward = progress - 0.5 * collision - 0.5 * offroad + 1.0 * newly_reached.float()
+        reward = (self.w_progress * progress - self.w_collision * collision
+                  - self.w_offroad * offroad + self.w_goal * newly_reached.float())
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
         self._reached = was_reached | (dist < self.goal_radius)

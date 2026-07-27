@@ -66,6 +66,11 @@ class PPOConfig:
     # rollout video camera: whole map by default, which is unreadable on a 1 km map
     video_follow: int = 0      # agent index to centre on (-1 = frame the whole map)
     video_fov: float = 120.0   # metres across the frame (ignored when video_follow < 0)
+    # reward weights (see AWSIMDrivingEnv.W_*); progress is in metres and dominates by default
+    w_progress: float = 1.0
+    w_goal: float = 1.0
+    w_offroad: float = 0.5
+    w_collision: float = 0.5
 
 
 class ActorCritic(nn.Module):
@@ -92,6 +97,13 @@ class ActorCritic(nn.Module):
         self.log_std = nn.Parameter(-0.5 * torch.ones(num_types, act_dim))
         self.value = nn.Linear(hidden, 1)
 
+    # Entropy of a Gaussian is a constant plus sum(log_std), so the `- ent_coef * entropy`
+    # term rewards growing log_std at a fixed rate; with log_std a free parameter and the
+    # policy-gradient signal weak, it drifts up without bound. Actions are clipped to
+    # [-1, 1] by the env, so once std is around 1 the rollouts are little more than noise
+    # and learning stalls while the deterministic (mean) policy still evaluates well.
+    LOG_STD_MIN, LOG_STD_MAX = -2.5, 0.0   # std in [0.08, 1.0]
+
     def _trunk(self, obs):
         B = obs.shape[0]
         ego = obs[:, :self.ego_dim]
@@ -105,14 +117,15 @@ class ActorCritic(nn.Module):
 
     def forward(self, obs):
         h = self._trunk(obs)
+        log_std_all = self.log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
         if self.num_types == 1:
             mean = self.mean[0](h)
-            log_std = self.log_std[0].expand_as(mean)
+            log_std = log_std_all[0].expand_as(mean)
         else:  # select each sample's per-type head using its ego type one-hot
             tidx = obs[:, self.type_slice[0]:self.type_slice[1]].argmax(dim=1)  # [B]
             means = torch.stack([head(h) for head in self.mean], dim=1)         # [B, T, act]
             mean = means[torch.arange(h.shape[0], device=h.device), tidx]
-            log_std = self.log_std[tidx]
+            log_std = log_std_all[tidx]
         return mean, log_std, self.value(h).squeeze(-1)
 
     def act(self, obs, deterministic=False):
@@ -163,7 +176,8 @@ def train(cfg: PPOConfig):
 
     env_cls = AWSIMHeteroDrivingEnv if cfg.hetero else AWSIMDrivingEnv
     env = env_cls(cfg.map_path, num_agents=cfg.num_agents, max_steps=cfg.max_steps,
-                  dt=cfg.dt, device=dev, seed=cfg.seed)
+                  dt=cfg.dt, device=dev, seed=cfg.seed, w_progress=cfg.w_progress, w_goal=cfg.w_goal,
+                  w_offroad=cfg.w_offroad, w_collision=cfg.w_collision)
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
                       env.MAX_ROAD, env.ROAD_FEATURES, ad, cfg.hidden,
