@@ -134,8 +134,11 @@ def point_at_arclen(polyline, s, cache=None):
     return x, y, float(np.arctan2(seg[i, 1], seg[i, 0]))
 
 
-def build_route(graph, start, max_lanelets=14, max_len=260.0):
-    """Chain following lanelets into a route and return its densified centerline."""
+def build_route(graph, start, max_lanelets=14, max_len=260.0, return_end=False):
+    """Chain following lanelets into a route and return its densified centerline.
+
+    With `return_end`, also returns the last lanelet of the chain, which lets a
+    caller continue the route later (see the rolling goals in `awsim_rl_env`)."""
     chain, seen, total, cur = [start], {start.id}, 0.0, start
     while len(chain) < max_lanelets and total < max_len:
         total += lanelet2.geometry.length(cur.centerline)
@@ -151,7 +154,8 @@ def build_route(graph, start, max_lanelets=14, max_len=260.0):
             xy = (p.x, p.y)
             if not pts or abs(pts[-1][0] - xy[0]) + abs(pts[-1][1] - xy[1]) > 1e-6:
                 pts.append(xy)
-    return np.asarray(pts, dtype=np.float64)
+    route = np.asarray(pts, dtype=np.float64)
+    return (route, chain[-1]) if return_end else route
 
 
 def resample_route(polyline, speed, dt, steps):

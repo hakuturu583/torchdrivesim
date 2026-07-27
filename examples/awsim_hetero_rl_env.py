@@ -46,10 +46,10 @@ from awsim_lanelet2_traffic import (
 # so Autoware participant tags + subtypes are honoured directly.
 TYPES = ["vehicle", "motorcycle", "cyclist", "pedestrian"]
 TYPE_SPEC = {
-    "vehicle":    dict(model=0, size=(4.97, 2.04), lr=1.96, vmax=14.0, participant="vehicle",    goal_dist=45.0, color=(32, 74, 135)),
-    "motorcycle": dict(model=0, size=(2.20, 0.90), lr=0.80, vmax=18.0, participant="motorcycle", goal_dist=45.0, color=(230, 90, 20)),
-    "cyclist":    dict(model=0, size=(1.80, 0.70), lr=0.60, vmax=6.0,  participant="bicycle",     goal_dist=30.0, color=(24, 104, 225)),
-    "pedestrian": dict(model=1, size=(0.70, 0.70), lr=0.50, vmax=2.0,  participant="pedestrian",  goal_dist=None, color=(173, 127, 168)),
+    "vehicle":    dict(model=0, size=(4.97, 2.04), lr=1.96, vmax=14.0, participant="vehicle",    goal_dist=150.0, color=(32, 74, 135)),
+    "motorcycle": dict(model=0, size=(2.20, 0.90), lr=0.80, vmax=18.0, participant="motorcycle", goal_dist=150.0, color=(230, 90, 20)),
+    "cyclist":    dict(model=0, size=(1.80, 0.70), lr=0.60, vmax=6.0,  participant="bicycle",     goal_dist=60.0, color=(24, 104, 225)),
+    "pedestrian": dict(model=1, size=(0.70, 0.70), lr=0.50, vmax=2.0,  participant="pedestrian",  goal_dist=20.0, color=(173, 127, 168)),
 }
 DEFAULT_MIX = {"vehicle": 0.4, "motorcycle": 0.15, "cyclist": 0.15, "pedestrian": 0.3}
 PARTICIPANT_ENUM = {
@@ -71,7 +71,11 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
     def __init__(self, map_path, num_agents=12, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, mix=None, render_fov=None, render_res=512, seed=0,
                  spawn_attempts=25, spawn_gap=1.5, pool_cap=120,
-                 w_progress=None, w_goal=None, w_offroad=None, w_collision=None):
+                 w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
+                 rolling_goals=None, goal_dist=None):
+        # goal_dist is per type here (TYPE_SPEC), so the scalar override is ignored
+        self.rolling_goals = self.ROLLING_GOALS if rolling_goals is None else rolling_goals
+        self.default_goal_dist = self.GOAL_DIST if goal_dist is None else goal_dist
         self.w_progress = self.W_PROGRESS if w_progress is None else w_progress
         self.w_goal = self.W_GOAL if w_goal is None else w_goal
         self.w_offroad = self.W_OFFROAD if w_offroad is None else w_offroad
@@ -144,60 +148,97 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         """One pool of (polyline, arc-length cache) per participant, built once
         from that participant's traffic rules (canPass) and routing graph."""
         participants = {TYPE_SPEC[t]["participant"] for t in TYPES}
-        self._pools = {}
+        self._pools, self._graphs = {}, {}
         for pkey in participants:
             rules = self._traffic_rules(pkey)
             graph = lanelet2.routing.RoutingGraph(self.lanelet_map, rules)
+            self._graphs[pkey] = graph
             polys = []
             for ll in self._passable_lanelets(rules):
                 if pkey == "pedestrian":  # pedestrians cross a single lanelet
-                    poly = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64)
+                    poly, end = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64), ll
                 else:                      # wheeled agents follow a legal downstream route
-                    poly = build_route(graph, ll)
+                    poly, end = build_route(graph, ll, return_end=True)
                 if poly.shape[0] >= 2:
                     cache = polyline_cumlen(poly)
                     if cache[2][-1] > 3.0:
-                        polys.append((poly, cache))
+                        # `end` is where the route stopped; rolling goals continue from it
+                        polys.append((poly, cache, end))
             self._pools[pkey] = polys
         for pkey in participants:  # any empty pool falls back to the vehicle network
             if not self._pools[pkey]:
                 self._pools[pkey] = self._pools.get("vehicle", [])
 
+    def _sample_one(self, spec, placed):
+        """Pick a collision-free start along a route from this type's pool. The goal sits
+        `goal_dist` ahead and is rolled forward on arrival (AWSIMDrivingEnv._advance_goals)."""
+        pool = self._pools[spec["participant"]]
+        radius = 0.5 * max(spec["size"]) + self.spawn_gap
+        attempt = None
+        for _ in range(self.spawn_attempts):
+            poly, cache, end = pool[self._rng.integers(len(pool))]
+            total = cache[2][-1]
+            s0 = self._rng.uniform(0.0, max(total - 3.0, 0.0) * 0.6)
+            x, y, h = point_at_arclen(poly, s0, cache)
+            gx, gy, _ = point_at_arclen(poly, min(s0 + spec["goal_dist"], total), cache)
+            attempt = (x, y, h, gx, gy, poly, end, s0)
+            if all((x - px) ** 2 + (y - py) ** 2 > (radius + pr) ** 2 for px, py, pr in placed):
+                return attempt
+        return attempt   # accept the last attempt if every one overlapped
+
+    def _respawn(self, i):
+        """Put agent i on a fresh route once its own runs out at the edge of the map,
+        keeping it clear of where the other agents currently are."""
+        spec = TYPE_SPEC[TYPES[self.agent_type_idx[i]]]
+        xy = self._state()[:, :2].tolist()
+        placed = [(px, py, 3.0) for j, (px, py) in enumerate(xy) if j != i]
+        x, y, h, _, _, poly, end, s0 = self._sample_one(spec, placed)
+        self._route_poly[i] = poly
+        self._route_cache[i] = polyline_cumlen(poly)
+        self._route_end_ll[i] = end
+        self._route_pkey[i] = spec["participant"]
+        self._s_goal[i] = s0
+        return x, y, h
+
     def _sample_spawns(self):
         placed = []  # (x, y, radius)
         starts, headings, goals = [], [], []
+        polys, ends, pkeys, s0s, gaps = [], [], [], [], []
         for tidx in self.agent_type_idx:
             spec = TYPE_SPEC[TYPES[tidx]]
-            pool = self._pools[spec["participant"]]
-            radius = 0.5 * max(spec["size"]) + self.spawn_gap
-            chosen = None
-            for _ in range(self.spawn_attempts):
-                poly, cache = pool[self._rng.integers(len(pool))]
-                total = cache[2][-1]
-                if spec["goal_dist"] is None:            # pedestrian: cross the whole lanelet
-                    forward = self._rng.random() < 0.5
-                    s0, sg = (0.0, total) if forward else (total, 0.0)
-                    x, y, h = point_at_arclen(poly, s0, cache)
-                    if not forward:
-                        h += np.pi
-                else:                                    # wheeled: start along lane, goal ahead
-                    s0 = self._rng.uniform(0.0, max(total - 3.0, 0.0) * 0.6)
-                    sg = min(s0 + spec["goal_dist"], total)
-                    x, y, h = point_at_arclen(poly, s0, cache)
-                gx, gy, _ = point_at_arclen(poly, sg, cache)
-                if all((x - px) ** 2 + (y - py) ** 2 > (radius + pr) ** 2 for px, py, pr in placed):
-                    chosen = (x, y, h, gx, gy)
-                    break
-            if chosen is None:  # accept the last attempt if all overlapped
-                chosen = (x, y, h, gx, gy)
-            placed.append((chosen[0], chosen[1], radius))
-            starts.append(chosen[:2]); headings.append(chosen[2]); goals.append(chosen[3:5])
+            x, y, h, gx, gy, poly, end, s0 = self._sample_one(spec, placed)
+            placed.append((x, y, 0.5 * max(spec["size"]) + self.spawn_gap))
+            starts.append((x, y)); headings.append(h); goals.append((gx, gy))
+            polys.append(poly); ends.append(end); pkeys.append(spec["participant"])
+            s0s.append(s0); gaps.append(spec["goal_dist"])
 
         A = self.num_agents
-        self.goals = torch.tensor(np.stack(goals), dtype=torch.float32, device=self.device)
+        self._route_end_ll, self._route_pkey = ends, pkeys
+        self._init_route_state(polys, s0s, gaps)
         self._init_state = torch.zeros(1, A, 4, device=self.device)
         self._init_state[0, :, :2] = torch.tensor(np.stack(starts), dtype=torch.float32, device=self.device)
         self._init_state[0, :, 2] = torch.tensor(np.stack(headings), dtype=torch.float32, device=self.device)
+
+    def _extend_route(self, i):
+        """Continue agent i's route through the lanelet graph so its goals can keep
+        rolling forward. False at a dead end, which parks that agent."""
+        graph = self._graphs[self._route_pkey[i]]
+        nxt = list(graph.following(self._route_end_ll[i]))
+        if not nxt:
+            return False
+        ext, end = build_route(graph, nxt[0], return_end=True)
+        if ext.shape[0] < 2:
+            return False
+        poly = self._route_poly[i]
+        if np.allclose(poly[-1], ext[0], atol=1e-6):   # drop the duplicated junction point
+            ext = ext[1:]
+        if ext.shape[0] < 1:
+            return False
+        # concatenating makes a fresh array, so the pool's shared polyline is untouched
+        self._route_poly[i] = np.concatenate([poly, ext], axis=0)
+        self._route_cache[i] = polyline_cumlen(self._route_poly[i])
+        self._route_end_ll[i] = end
+        return True
 
     def _build_simulator(self):
         A = self.num_agents
@@ -252,3 +293,4 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         for i, t in enumerate(TYPES):  # per-type goal-reaching
             m = (self._type_idx_t == i)
             info[f'reached_{t}'] = float(self._reached[m].float().mean()) if bool(m.any()) else 0.0
+            info[f'goals_{t}'] = float(self._goals_reached[m].mean()) if bool(m.any()) else 0.0

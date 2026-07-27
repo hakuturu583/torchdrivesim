@@ -67,6 +67,9 @@ class PPOConfig:
     video_follow: int = 0      # agent index to centre on (-1 = frame the whole map)
     video_fov: float = 120.0   # metres across the frame (ignored when video_follow < 0)
     # reward weights (see AWSIMDrivingEnv.W_*); progress is in metres and dominates by default
+    # rolling goals: on arrival the next goal is placed goal_dist further along the route
+    rolling_goals: bool = True
+    goal_dist: float = -1.0    # base env only, metres; <0 keeps the env default
     w_progress: float = 1.0
     w_goal: float = 1.0
     w_offroad: float = 0.5
@@ -176,7 +179,9 @@ def train(cfg: PPOConfig):
 
     env_cls = AWSIMHeteroDrivingEnv if cfg.hetero else AWSIMDrivingEnv
     env = env_cls(cfg.map_path, num_agents=cfg.num_agents, max_steps=cfg.max_steps,
-                  dt=cfg.dt, device=dev, seed=cfg.seed, w_progress=cfg.w_progress, w_goal=cfg.w_goal,
+                  dt=cfg.dt, device=dev, seed=cfg.seed, rolling_goals=cfg.rolling_goals,
+                  goal_dist=(cfg.goal_dist if cfg.goal_dist > 0 else None),
+                  w_progress=cfg.w_progress, w_goal=cfg.w_goal,
                   w_offroad=cfg.w_offroad, w_collision=cfg.w_collision)
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
@@ -212,7 +217,7 @@ def train(cfg: PPOConfig):
         # further in each time) and swings wildly for no reason related to learning.
         # Goal-reaching is therefore collected at episode boundaries, and the per-step
         # infraction rates are averaged over the whole rollout.
-        ep_reached, ep_reached_type = [], {}
+        ep_reached, ep_reached_type, ep_goals = [], {}, []
         step_coll, step_off = [], []
 
         for t in range(cfg.rollout_steps):
@@ -229,8 +234,9 @@ def train(cfg: PPOConfig):
             if bool(done.all()):  # episode boundary -> log and reset
                 completed_returns.append(float(ep_return.mean()))
                 ep_reached.append(info['reached'])
+                ep_goals.append(info['goals'])
                 for k, v in info.items():
-                    if k.startswith('reached_'):
+                    if k.startswith('reached_') or k.startswith('goals_'):
                         ep_reached_type.setdefault(k, []).append(v)
                 ep_return = torch.zeros(A, device=dev)
                 obs = env.reset()
@@ -275,20 +281,23 @@ def train(cfg: PPOConfig):
         history.append(mean_ret)
         # falls back to the last snapshot only when the rollout spans no full episode
         mean_reached = float(np.mean(ep_reached)) if ep_reached else info['reached']
+        mean_goals = float(np.mean(ep_goals)) if ep_goals else info['goals']
         mean_coll, mean_off = float(np.mean(step_coll)), float(np.mean(step_off))
         reached_type = {k: float(np.mean(v)) for k, v in ep_reached_type.items()} or \
                        {k: v for k, v in info.items() if k.startswith('reached_')}
         print(f"upd {update+1:4d}/{cfg.updates} | return {mean_ret:8.3f} | "
-              f"reached {mean_reached:.2f} coll {mean_coll:.2f} off {mean_off:.2f} | "
+              f"goals {mean_goals:5.2f} reached {mean_reached:.2f} coll {mean_coll:.2f} "
+              f"off {mean_off:.2f} | "
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
             torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))
         if run is not None:
-            metrics = {"return": mean_ret, "reached": mean_reached,
+            metrics = {"return": mean_ret, "reached": mean_reached, "goals": mean_goals,
                        "collision": mean_coll, "offroad": mean_off,
                        "loss/policy": last_stats[0], "loss/value": last_stats[1],
                        "entropy": last_stats[2]}
-            metrics.update({f"reached/{k[8:]}": v for k, v in reached_type.items()})
+            metrics.update({(f"reached/{k[8:]}" if k.startswith('reached_') else f"goals/{k[6:]}"): v
+                            for k, v in reached_type.items()})
             run.log(metrics, step=update)
 
     # save reward curve
@@ -318,10 +327,11 @@ def train(cfg: PPOConfig):
             break
     video = save_video(frames, cfg.save_dir, "awsim_rl_rollout", cfg.dt, "mp4")
     print(f"[done] policy -> {os.path.join(cfg.save_dir, 'policy.pt')}")
-    print(f"[done] rollout video -> {video}  (final reached {info['reached']:.2f})")
-    per_type = {k: v for k, v in info.items() if k.startswith('reached_')}
+    print(f"[done] rollout video -> {video}  (final goals/agent {info['goals']:.2f}, "
+          f"reached {info['reached']:.2f})")
+    per_type = {k: v for k, v in info.items() if k.startswith('goals_')}
     if per_type:
-        print("[done] per-type reached: " + ", ".join(f"{k[8:]} {v:.2f}" for k, v in per_type.items()))
+        print("[done] per-type goals/agent: " + ", ".join(f"{k[6:]} {v:.2f}" for k, v in per_type.items()))
 
     if run is not None:
         import wandb

@@ -25,6 +25,7 @@ from torchdrivesim.utils import Resolution
 
 from awsim_lanelet2_traffic import (
     map_latlon_origin, build_driving_surface_mesh, build_route, _attr, mesh_camera,
+    polyline_cumlen, point_at_arclen,
 )
 from torchdrivesim.lanelet2 import load_lanelet_map
 import lanelet2
@@ -66,9 +67,19 @@ class AWSIMDrivingEnv:
     W_OFFROAD = 0.5
     W_COLLISION = 0.5
 
+    # Rolling goals: instead of parking an agent at its single goal, the next goal is
+    # placed GOAL_DIST further along the same route, and the route is extended through
+    # the lanelet graph when it runs out. An episode is then a continuous drive ending
+    # only at max_steps, and the score is "goals collected", not "did it arrive".
+    GOAL_DIST = 150.0
+    ROLLING_GOALS = True
+
     def __init__(self, map_path, num_agents=8, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, render_fov=None, render_res=512, seed=0,
-                 w_progress=None, w_goal=None, w_offroad=None, w_collision=None):
+                 w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
+                 rolling_goals=None, goal_dist=None):
+        self.rolling_goals = self.ROLLING_GOALS if rolling_goals is None else rolling_goals
+        self.default_goal_dist = self.GOAL_DIST if goal_dist is None else goal_dist
         self.w_progress = self.W_PROGRESS if w_progress is None else w_progress
         self.w_goal = self.W_GOAL if w_goal is None else w_goal
         self.w_offroad = self.W_OFFROAD if w_offroad is None else w_offroad
@@ -108,7 +119,8 @@ class AWSIMDrivingEnv:
 
         starts = np.stack([r[0] for r in routes])          # (A, 2)
         headings = np.stack([np.arctan2(*(r[1] - r[0])[::-1]) for r in routes])  # (A,)
-        self.goals = torch.tensor(np.stack([r[-1] for r in routes]), dtype=torch.float32, device=device)
+        self._init_route_state(routes, np.zeros(num_agents),
+                               np.full(num_agents, self.default_goal_dist))
         self._init_state = torch.zeros(1, num_agents, 4, device=device)
         self._init_state[0, :, :2] = torch.tensor(starts, dtype=torch.float32, device=device)
         self._init_state[0, :, 2] = torch.tensor(headings, dtype=torch.float32, device=device)
@@ -222,6 +234,82 @@ class AWSIMDrivingEnv:
     def _dist_to_goal(self, state):
         return torch.linalg.norm(state[:, :2] - self.goals, dim=-1)  # (A,)
 
+    # ------------------------------------------------------- rolling goals
+    def _init_route_state(self, polys, s_start, goal_dist):
+        """Per-agent route bookkeeping: the polyline the agent follows, its arc-length
+        cache, and the arc-length at which its current goal sits."""
+        self._route_poly = list(polys)
+        self._route_cache = [polyline_cumlen(p) for p in self._route_poly]
+        self._goal_dist = np.asarray(goal_dist, dtype=np.float64)
+        self._s_goal = np.minimum(np.asarray(s_start, dtype=np.float64) + self._goal_dist,
+                                  self._route_totals())
+        self._s_goal0 = self._s_goal.copy()   # restored by reset()
+        self._goals_np = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
+        self._goals_reached = torch.zeros(self.num_agents, device=self.device)
+        self._sync_goals(range(self.num_agents))
+
+    def _reset_route_state(self):
+        """Rewind the rolling goals to where the current spawn placed them."""
+        self._s_goal = self._s_goal0.copy()
+        self._sync_goals(range(self.num_agents))
+
+    def _route_totals(self):
+        return np.array([float(c[2][-1]) for c in self._route_cache])
+
+    def _sync_goals(self, idx):
+        """Refresh the goal positions of `idx` from their route arc-lengths. Goals live
+        in a numpy buffer so only one host-to-device copy happens per step."""
+        for i in idx:
+            self._goals_np[i] = point_at_arclen(self._route_poly[i], self._s_goal[i],
+                                                self._route_cache[i])[:2]
+        self.goals = torch.as_tensor(self._goals_np, device=self.device)
+
+    def _extend_route(self, i):
+        """Chain more lanelets onto agent i's route. False if it cannot be extended;
+        the base env's routes are fixed, so only the hetero env implements this."""
+        return False
+
+    def _respawn(self, i):
+        """Move agent i to a fresh route after it runs out of road. Returns the new
+        (x, y, heading), or None if the env cannot respawn (base env)."""
+        return None
+
+    def _advance_goals(self, mask):
+        """Place the next goal further along the route for every agent in `mask`.
+
+        The map is a finite cut-out, so a route eventually reaches its edge; rather
+        than parking the agent there, it is respawned on a fresh route (which is why
+        this returns whether any agent moved - the caller must re-read the state).
+        """
+        idx = mask.nonzero(as_tuple=True)[0].tolist()
+        moved = []
+        for i in idx:
+            s = self._s_goal[i] + self._goal_dist[i]
+            total = float(self._route_cache[i][2][-1])
+            if s > total - 1e-3:
+                if self._extend_route(i):
+                    total = float(self._route_cache[i][2][-1])
+                else:
+                    pose = self._respawn(i)
+                    if pose is None:   # nowhere to go: the agent stops earning goals
+                        self._route_exhausted[i] = True
+                        self._s_goal[i] = total
+                        continue
+                    moved.append((i, pose))
+                    total = float(self._route_cache[i][2][-1])
+                    s = min(self._goal_dist[i], total)
+            self._s_goal[i] = min(s, total)
+        self._sync_goals(idx)
+        if moved:
+            state = self._state().clone()
+            m = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
+            for i, (x, y, h) in moved:
+                state[i, 0], state[i, 1], state[i, 2], state[i, 3] = x, y, h, 0.0
+                m[i] = True
+            self.simulator.set_state(state.unsqueeze(0), mask=m.unsqueeze(0))
+        return bool(moved)
+
     def _observation(self, state, prev_action):
         # [A, EGO_DIM | MAX_PARTNERS*PARTNER_FEATURES | MAX_ROAD*ROAD_FEATURES];
         # the policy slices off the ego part and max-pools the partner and road sets.
@@ -320,10 +408,13 @@ class AWSIMDrivingEnv:
 
     def reset(self):
         self._prepare_reset()
+        self._reset_route_state()
         self._build_simulator()
         self._t = 0
         self._prev_action = torch.zeros(self.num_agents, self.ACT_DIM, device=self.device)
         self._reached = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
+        self._goals_reached = torch.zeros(self.num_agents, device=self.device)
+        self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         state = self._state()
         self._prev_dist = self._dist_to_goal(state)
         return self._observation(state, self._prev_action)
@@ -347,7 +438,19 @@ class AWSIMDrivingEnv:
                   - self.w_offroad * offroad + self.w_goal * newly_reached.float())
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
-        self._reached = was_reached | (dist < self.goal_radius)
+        self._goals_reached += newly_reached.float()
+        if self.rolling_goals:
+            # Hand out the next goal instead of parking the agent. Only an agent whose
+            # route cannot be extended any further is finished.
+            if bool(newly_reached.any()):
+                if self._advance_goals(newly_reached):
+                    state = self._state()      # some agents were respawned elsewhere
+                # the goal moved, so re-measure: otherwise the jump in distance would be
+                # charged to the next step as a large negative `progress`
+                dist = self._dist_to_goal(state)
+            self._reached = was_reached | (newly_reached & self._route_exhausted)
+        else:
+            self._reached = was_reached | (dist < self.goal_radius)
         # Freeze finished agents in place so they stop moving and don't drift into others.
         if self._reached.any():
             frozen = state.clone(); frozen[self._reached, 3] = 0.0
@@ -361,6 +464,7 @@ class AWSIMDrivingEnv:
         active = ~was_reached
         info = {
             'reached': float(self._reached.float().mean()),
+            'goals': float(self._goals_reached.mean()),   # goals collected per agent
             'collision': float(collision[active].mean()) if bool(active.any()) else 0.0,
             'offroad': float(offroad[active].mean()) if bool(active.any()) else 0.0,
             'active': active,
