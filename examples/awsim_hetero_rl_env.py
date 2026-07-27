@@ -88,6 +88,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self._center, default_fov = mesh_camera(self.mesh)
         self.render_fov = render_fov if render_fov is not None else default_fov
         self._build_road_graph()
+        self._build_offroad_index()
 
         # fixed per-agent type + derived static properties
         counts = self._allocate(num_agents, mix)
@@ -201,6 +202,9 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         walk = SimpleKinematicModel(dt=self.dt, max_dx=TYPE_SPEC["pedestrian"]["vmax"])
         walk.set_state(self._init_state[0, ped].clone())
         kin = CompoundKinematicModel([bike, walk], model_assignments=assign, dt=self.dt)
+        # State/params are already on device, but each model's action `_normalization_factor`
+        # is built on CPU in the constructor - move the whole model over.
+        kin = kin.to(self.device)
 
         renderer = renderer_from_config(RendererConfig(left_handed_coordinates=False))
         for t in TYPES:

@@ -13,5 +13,5 @@ shapely                  # required by torchdrivesim.infractions
 imageio
 imageio-ffmpeg           # mp4 video output (save_video)
 matplotlib               # reward-curve plot in awsim_rl_train.py (optional)
-# wandb                  # optional: metrics logging (awsim_rl_train.py wandb=true)
+wandb                    # metrics logging (awsim_rl_train.py wandb=true; imported only then)
 pytest                   # examples/tests smoke tests

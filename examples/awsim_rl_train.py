@@ -63,6 +63,9 @@ class PPOConfig:
     wandb: bool = False        # log metrics to Weights & Biases
     wandb_project: str = "awsim-rl"
     wandb_run: str = ""        # optional run name
+    # rollout video camera: whole map by default, which is unreadable on a 1 km map
+    video_follow: int = 0      # agent index to centre on (-1 = frame the whole map)
+    video_fov: float = 120.0   # metres across the frame (ignored when video_follow < 0)
 
 
 class ActorCritic(nn.Module):
@@ -189,6 +192,14 @@ def train(cfg: PPOConfig):
         b_done = torch.zeros(cfg.rollout_steps, A, device=dev)
         b_active = torch.zeros(cfg.rollout_steps, A, device=dev)
         completed_returns = []
+        # `info` is a snapshot of the step it came from: `reached` accumulates over an
+        # episode and resets with it, so reading it off the last rollout step samples a
+        # different point of the episode every update (rollout_steps % max_steps steps
+        # further in each time) and swings wildly for no reason related to learning.
+        # Goal-reaching is therefore collected at episode boundaries, and the per-step
+        # infraction rates are averaged over the whole rollout.
+        ep_reached, ep_reached_type = [], {}
+        step_coll, step_off = [], []
 
         for t in range(cfg.rollout_steps):
             with torch.no_grad():
@@ -199,8 +210,14 @@ def train(cfg: PPOConfig):
             b_active[t] = info['active'].float()
             ep_return += reward
             obs = next_obs
+            step_coll.append(info['collision'])
+            step_off.append(info['offroad'])
             if bool(done.all()):  # episode boundary -> log and reset
                 completed_returns.append(float(ep_return.mean()))
+                ep_reached.append(info['reached'])
+                for k, v in info.items():
+                    if k.startswith('reached_'):
+                        ep_reached_type.setdefault(k, []).append(v)
                 ep_return = torch.zeros(A, device=dev)
                 obs = env.reset()
 
@@ -242,17 +259,22 @@ def train(cfg: PPOConfig):
 
         mean_ret = np.mean(completed_returns) if completed_returns else float(b_rew.sum(0).mean())
         history.append(mean_ret)
+        # falls back to the last snapshot only when the rollout spans no full episode
+        mean_reached = float(np.mean(ep_reached)) if ep_reached else info['reached']
+        mean_coll, mean_off = float(np.mean(step_coll)), float(np.mean(step_off))
+        reached_type = {k: float(np.mean(v)) for k, v in ep_reached_type.items()} or \
+                       {k: v for k, v in info.items() if k.startswith('reached_')}
         print(f"upd {update+1:4d}/{cfg.updates} | return {mean_ret:8.3f} | "
-              f"reached {info['reached']:.2f} coll {info['collision']:.2f} off {info['offroad']:.2f} | "
+              f"reached {mean_reached:.2f} coll {mean_coll:.2f} off {mean_off:.2f} | "
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
             torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))
         if run is not None:
-            metrics = {"return": mean_ret, "reached": info["reached"],
-                       "collision": info["collision"], "offroad": info["offroad"],
+            metrics = {"return": mean_ret, "reached": mean_reached,
+                       "collision": mean_coll, "offroad": mean_off,
                        "loss/policy": last_stats[0], "loss/value": last_stats[1],
                        "entropy": last_stats[2]}
-            metrics.update({f"reached/{k[8:]}": v for k, v in info.items() if k.startswith("reached_")})
+            metrics.update({f"reached/{k[8:]}": v for k, v in reached_type.items()})
             run.log(metrics, step=update)
 
     # save reward curve
@@ -271,12 +293,13 @@ def train(cfg: PPOConfig):
 
     # greedy evaluation rollout -> video
     obs = env.reset()
-    frames = [env.render_frame()]
+    cam = dict(follow=cfg.video_follow, fov=cfg.video_fov) if cfg.video_follow >= 0 else {}
+    frames = [env.render_frame(**cam)]
     for _ in range(cfg.max_steps):
         with torch.no_grad():
             action, _, _ = net.act(obs, deterministic=True)
         obs, _, done, info = env.step(action)
-        frames.append(env.render_frame())
+        frames.append(env.render_frame(**cam))
         if bool(done.all()):
             break
     video = save_video(frames, cfg.save_dir, "awsim_rl_rollout", cfg.dt, "mp4")

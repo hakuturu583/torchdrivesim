@@ -48,6 +48,14 @@ docs = ["Sphinx",
 "nbsphinx",
 "breathe"]
 
+# Extra tooling for the AWSIM RL examples (see examples/requirements-awsim.txt).
+# Installed by default via [tool.uv] default-groups, so `uv run wandb ...` works.
+[dependency-groups]
+rl = ["wandb", "imageio-ffmpeg", "matplotlib"]
+
+[tool.uv]
+default-groups = ["rl"]
+
 [tool.setuptools.dynamic]
 version = {attr = "torchdrivesim.__version__"}
 

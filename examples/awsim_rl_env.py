@@ -16,6 +16,8 @@ Rendering is only used when saving a video, so rollouts stay fast on CPU.
 import numpy as np
 import torch
 
+from torchdrivesim._iou_utils import box2corners_th
+from torchdrivesim.infractions import bbox2discs, point_to_mesh_distance_pt
 from torchdrivesim.kinematic import KinematicBicycle
 from torchdrivesim.rendering import renderer_from_config, RendererConfig
 from torchdrivesim.simulator import TorchDriveConfig, Simulator
@@ -71,6 +73,7 @@ class AWSIMDrivingEnv:
         self._center, default_fov = mesh_camera(self.mesh)
         self.render_fov = render_fov if render_fov is not None else default_fov
         self._build_road_graph()
+        self._build_offroad_index()
 
         # --- lane-following routes -> start states + goals ---
         rules = lanelet2.traffic_rules.create(Locations.Germany, Participants.Vehicle)
@@ -117,11 +120,76 @@ class AWSIMDrivingEnv:
         self._road_xy = torch.tensor(xy, device=self.device)          # [M, 2]
         self._road_dir = torch.tensor(hdg, device=self.device)        # [M]
 
+    # ------------------------------------------------------------- offroad
+    # `Simulator.compute_offroad` (without pytorch3d) expands the *whole* driving
+    # surface mesh once per agent corner and brute-forces the point-to-triangle
+    # distance: cost and memory are O(num_agents x faces), which on the full
+    # Shinjuku map (113k faces) is ~75% of the step time and OOMs past ~128 agents.
+    # Only faces near an agent can be its closest face, so we keep the exact
+    # distance computation but restrict it to the OFFROAD_FACES nearest faces
+    # (by face centroid), which is a superset of the candidates by a wide margin.
+    OFFROAD_FACES = 128
+
+    def _build_offroad_index(self):
+        verts = self.mesh.verts[0][..., :2]                            # [V, 2]
+        faces = self.mesh.faces[0]                                     # [F, 3]
+        tris = verts[faces]                                            # [F, 3, 2]
+        self._face_tris = torch.nn.functional.pad(tris, (0, 1))        # [F, 3, 3], z=0
+        self._face_centroid = tris.mean(dim=-2)                        # [F, 2]
+        # circumradius per face: dist(agent, face) >= dist(agent, centroid) - radius,
+        # so ranking by that lower bound (rather than by raw centroid distance) keeps
+        # large triangles in the candidate set instead of losing them to nearer-centroid
+        # small ones.
+        self._face_radius = (tris - self._face_centroid.unsqueeze(-2)).norm(dim=-1).max(dim=-1).values
+        self._offroad_k = min(self.OFFROAD_FACES, faces.shape[0])
+
+    def _offroad(self, state):
+        """Per-agent offroad loss, equivalent to `simulator.compute_offroad()[0]`."""
+        A, K = self.num_agents, self._offroad_k
+        lenwid = self.simulator.get_agent_size()[0][..., :2]           # [A, 2]
+        rect = torch.cat([state[:, :2], lenwid, state[:, 2:3]], dim=-1)
+        corners = box2corners_th(rect.unsqueeze(0))[0]                 # [A, 4, 2]
+        # candidate faces: the K nearest by centroid to the agent centre
+        d = torch.cdist(state[:, :2], self._face_centroid) - self._face_radius
+        idx = d.topk(K, dim=-1, largest=False).indices                 # [A, K]
+        tris = self._face_tris[idx]                                    # [A, K, 3, 3]
+        tris = tris.unsqueeze(1).expand(A, 4, K, 3, 3).reshape(A * 4, K, 3, 3)
+        pts = torch.nn.functional.pad(corners, (0, 1)).reshape(A * 4, 3)
+        thr = self.simulator.cfg.offroad_threshold
+        dist = point_to_mesh_distance_pt(pts, tris, threshold=thr)     # [A*4, 1]
+        return dist.reshape(A, 4).sum(dim=-1) * self.simulator.get_present_mask()[0]
+
+    # ----------------------------------------------------------- collision
+    # `Simulator.compute_collision` loops over agents in Python (it carries a
+    # "TODO: batch across agent dimension"), so at A agents it issues A x small
+    # kernels per step and is launch-overhead bound. This is the same `discs`
+    # metric computed for all agent pairs at once.
+    def _collision(self, state):
+        """Per-agent collision loss, equivalent to `simulator.compute_collision()[0]`."""
+        A = self.num_agents
+        size = self.simulator.get_agent_size()[0][..., :2]
+        box = torch.nan_to_num(torch.cat([state[:, :2], size, state[:, 2:3]], dim=-1))
+        centers, r = bbox2discs(box)                                   # [A, D, 2], [A, 1]
+        D = centers.shape[-2]
+        # map coordinates are O(100 m), so the matmul-based cdist loses precision
+        # exactly where it matters (near-touching agents); ask for the direct form.
+        flat = centers.reshape(A * D, 2)
+        d = torch.cdist(flat, flat, compute_mode='donot_use_mm_for_euclid_dist')
+        d = d.reshape(A, D, A, D).permute(0, 2, 1, 3).reshape(A, A, D * D)
+        d = d.min(dim=-1).values                                       # [A, A] closest discs
+        overlap = torch.relu(1 - d / (r + r.transpose(0, 1)))          # [A, A]
+        mask = self.simulator.get_present_mask()[0].to(overlap.dtype)
+        overlap = torch.nan_to_num(overlap) * mask.unsqueeze(0)
+        overlap = overlap - torch.diag_embed(overlap.diagonal())       # drop self-overlap
+        return overlap.sum(dim=-1) * mask
+
     def _build_simulator(self):
         A = self.num_agents
         kin = KinematicBicycle(dt=self.dt)
         kin.set_params(lr=torch.full((1, A), self.lr, device=self.device))
         kin.set_state(self._init_state.clone())
+        # The action `_normalization_factor` is built on CPU in the constructor.
+        kin = kin.to(self.device)
         cfg = TorchDriveConfig(left_handed_coordinates=False,
                                renderer=RendererConfig(left_handed_coordinates=False))
         self.renderer = renderer_from_config(cfg.renderer)
@@ -256,8 +324,8 @@ class AWSIMDrivingEnv:
         dist = self._dist_to_goal(state)
 
         progress = (self._prev_dist - dist)                                   # dense shaping
-        collision = (self.simulator.compute_collision()[0] > 0).float()
-        offroad = (self.simulator.compute_offroad()[0] > 0).float()
+        collision = (self._collision(state) > 0).float()
+        offroad = (self._offroad(state) > 0).float()
         newly_reached = (dist < self.goal_radius) & (~was_reached)
         reward = progress - 0.5 * collision - 0.5 * offroad + 1.0 * newly_reached.float()
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
@@ -284,10 +352,18 @@ class AWSIMDrivingEnv:
         return self._observation(state, action), reward, done, info
 
     # --------------------------------------------------------------- render
-    def render_frame(self):
-        cam = torch.tensor([[list(self._center)]], device=self.device)
+    def render_frame(self, follow=None, fov=None):
+        """Bird's-eye frame. By default the camera frames the whole map, which on a
+        1 km map makes the agents a few pixels wide; pass `follow` (an agent index)
+        to centre on that agent and `fov` (metres across) to zoom in."""
+        if follow is not None:
+            centre = self._state()[follow, :2].tolist()
+        else:
+            centre = list(self._center)
+        cam = torch.tensor([[centre]], device=self.device)
         psi = torch.zeros(1, 1, 1, device=self.device)
+        fov = self.render_fov if fov is None else fov
         img = self.simulator.render(camera_xy=cam, camera_psi=psi,
                                     res=Resolution(self.render_res, self.render_res),
-                                    fov=self.render_fov)
+                                    fov=fov)
         return img[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8)

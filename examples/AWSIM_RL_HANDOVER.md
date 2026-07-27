@@ -150,7 +150,7 @@ python examples/awsim_rl_train.py hetero=true \
   device=cuda num_agents=64 updates=3000 rollout_steps=256 \
   checkpoint_every=100          # writes policy_<n>.pt; resume=<path> to warm-start
 ```
-Metrics can go to **Weights & Biases** (`pip install wandb`):
+Metrics can go to **Weights & Biases** (`wandb` is in `examples/requirements-awsim.txt`):
 ```bash
 python examples/awsim_rl_train.py hetero=true device=cuda ... \
   wandb=true wandb_project=awsim-rl wandb_run=shinjuku-64a
@@ -161,16 +161,53 @@ when `wandb=true`.
 
 Config knobs (OmegaConf dot-list): `updates, rollout_steps, num_agents, max_steps, dt,
 gamma, gae_lambda, clip_coef, ent_coef, vf_coef, lr, update_epochs, minibatches, hidden,
-seed, hetero, smoke_test, checkpoint_every, resume, wandb, wandb_project, wandb_run`. Env knobs live in the env `__init__`
+seed, hetero, smoke_test, checkpoint_every, resume, wandb, wandb_project, wandb_run,
+video_follow, video_fov`. Env knobs live in the env `__init__`
 (`mix`, `spawn_gap`, `pool_cap`, `goal_radius`, `MAX_PARTNERS`/`MAX_ROAD`/radii as class
 attrs). Progress prints are flushed, so `tail -f` works during long runs.
 
-The code is **device-correct for CUDA** (all env tensors carry `device=`, index tensors are
-on-device, GAE runs on the rollout device); verified on CPU, and audited for the CUDA path.
-Building the env on the full Shinjuku map takes **~60-70 s once** (four per-participant
-routing graphs + route pools + the road-point cloud); the per-step cost is small. On CPU
-the training bottleneck is the rollout; a GPU makes the deep-sets policy and larger
-`num_agents` practical.
+The rollout video frames the whole 1 km map by default, where agents are a few pixels
+wide. `video_follow=<agent index> video_fov=<metres>` centres the camera on one agent
+(default: agent 0 at 120 m).
+
+Building the env on the full Shinjuku map takes **~11 s once** (four per-participant
+routing graphs + route pools + the road-point cloud).
+
+### Performance (measured on an RTX 3090, full Shinjuku map, hetero env)
+
+The CUDA path had a real bug and two O(num_agents) bottlenecks, all fixed:
+
+- Both envs built their kinematic models without `.to(device)`, leaving each model's
+  action `_normalization_factor` on the CPU: `device=cuda` died immediately in
+  `denormalize_action`. (The earlier "audited for the CUDA path" claim was wrong.)
+- `Simulator.compute_offroad` (non-pytorch3d path) does `mesh.expand(num_agents*4)` and
+  brute-forces point-to-triangle distance against all 113,005 faces — 75% of step time
+  and the reason 256 agents OOM'd 24 GB. `AWSIMDrivingEnv._offroad` keeps the same exact
+  distance computation but restricts it to the 128 nearest faces, ranked by centroid
+  distance minus face circumradius (a lower bound on the true distance, so large
+  triangles are not lost to nearer-centroid small ones).
+- `Simulator.compute_collision` loops over agents in Python (it carries a "TODO: batch
+  across agent dimension") and is launch-overhead bound. `AWSIMDrivingEnv._collision`
+  computes the same `discs` metric for all pairs at once. Map coordinates are O(100 m),
+  so it asks `cdist` for `donot_use_mm_for_euclid_dist` — the matmul form loses precision
+  exactly where it matters, at near-contact.
+
+Both were validated against the library implementations over 768 agent-samples spanning
+on-road, near-edge and far-off-road states: **zero boolean disagreements**; collision also
+matches numerically, and offroad's only residual is a conservative overestimate for agents
+far outside the map.
+
+```
+                before                    after
+A= 64    1238 ms/step  5.8 GB   →     5.9 ms/step  0.1 GB
+A=128       (OOM territory)     →     7.3 ms/step  0.1 GB
+A=256    CUDA OOM (24 GB)       →    11.7 ms/step  0.2 GB   (21.8k agent-steps/s)
+A=512             -             →    25.1 ms/step  0.5 GB
+```
+
+Before the fix, throughput was flat in `num_agents` (~50 agent-steps/s at both 16 and 64),
+so raising parallelism bought nothing; now it scales, and 3000 updates at 256 agents take
+~3 h instead of ~5 days.
 
 ## Tests
 
@@ -193,21 +230,37 @@ python -m pytest tests/test_awsim_examples.py -q     # 7 passed (~7 s)
   agents: return −9 → ~+5 (still climbing), final greedy reached ≈ 0.56 (vehicle 1.0,
   pedestrian 0.25, moto/cyclist 0 — only 3 each, under-trained).
 
+## First full GPU run (RTX 3090, 2026-07-28)
+
+`hetero=true num_agents=256 updates=3000 rollout_steps=256 lr=5e-4`, full Shinjuku map,
+~3 h. wandb: `mskataoka/awsim-rl`, run `shinjuku-hetero-256a-lr5e-4`. Final greedy rollout
+**reached 0.71** — vehicle 1.00, motorcycle 1.00, cyclist 0.97, **pedestrian 0.03**.
+
+Caveats, in order of importance:
+
+- **The reference `lr=3e-3` diverges here.** At 256 agents it peaked around update 160
+  (reached ≈ 0.59) and then decayed to 0.36 by update 400 while entropy climbed 4.2 → 6.9.
+  `lr=5e-4` survived 3000 updates. Checkpoints of the diverged run were kept for comparison.
+- **Return plateaus by update ~250** and does not move for the remaining 2750 (reached
+  stays 0.70–0.72). More updates are not the lever.
+- **Entropy still inflates** (3.0 → 8.4 over the run) even at the lower lr — return holds
+  but the policy keeps getting noisier. `ent_coef=0.005` is the suspect.
+- **Offroad never improves** (0.22–0.49 throughout), so the 0.5 penalty is likely too weak
+  relative to the progress term.
+- **Pedestrians barely function** (reached 0.03) — see limitation 3 below.
+
 ## Known limitations / open issues (good first tasks on GPU)
 
-1. **Under-trained on CPU.** The rich obs (104/140-dim) + 3 encoders + per-type heads need
-   many more updates than we could run on CPU. First GPU job: reproduce a clean learning
-   curve with `updates≈2000–3000`, `num_agents≈64`, and confirm minority types (moto,
-   cyclist, pedestrian) actually improve with the per-type heads.
+1. ~~**Under-trained on CPU.**~~ Done — see the GPU run above. The open question is no
+   longer throughput but reward/entropy shaping: the curve flatlines at reached ≈ 0.71.
 2. **Offroad still non-zero** at intersections — agents cut corners. Road-graph obs helps;
    consider adding a **lane-alignment reward** (PufferDrive `reward_lane_align`) or a
    heavier offroad weight. Tune per type.
 3. **Pedestrians lag.** Different kinematics + short crosswalk goals. Per-type heads are in;
    next levers are per-type reward weights / goal radius, or a pedestrian-specific curriculum.
 4. **Rendering is the training bottleneck for full-map viz**, not training itself (RL loop
-   doesn't render except when saving video). Full Shinjuku lane-mesh build is ~30 s (once);
-   per-frame render ~1–2 s on CPU → use a GPU renderer (pytorch3d/nvdiffrast) for videos, or
-   render a cropped region.
+   doesn't render except when saving video). Use `video_follow`/`video_fov` to render a
+   cropped region — a whole-map frame is also unreadable at 1 km across.
 5. **`reset()` rebuilds the Simulator each episode** (renderer + kinematic model). Left as-is
    for correctness/simplicity; if reset overhead matters at scale, reuse the simulator and
    only `set_state`/reset masks (mirrors `gym_env.py`'s copy pattern). Flagged, not done.
@@ -216,6 +269,14 @@ python -m pytest tests/test_awsim_examples.py -q     # 7 passed (~7 s)
    vmax, pedestrian dwell on walkways.
 7. **No road-graph in the base (vehicle-only) env's spawn variety** beyond routes — fine, but
    note base env spawns are fixed at init (only hetero re-randomises spawns each reset).
+8. **`pool_cap` caps spawn origins, not coverage.** With the default `pool_cap=120`, spawn
+   *origins* come from 120 of 884 passable lanelets for wheeled types (bicycle 120/282,
+   pedestrian 92/92), fixed once at construction. Because wheeled agents follow a route
+   downstream, spawn+goal points still cover 93% of the road network on a 50 m grid (87% at
+   20 m), so the map is effectively covered — but the set of starting lanelets is not.
+   Raise `pool_cap` to widen it (costs a one-off route-pool build).
+9. **Episodes are 8 s** (`max_steps=80 × dt=0.1`) with a 45 m goal for vehicles, so what is
+   being learnt is short-range driving sampled all over the map, not long-range routing.
 
 ## Environment/tooling gotchas discovered
 
@@ -231,6 +292,21 @@ python -m pytest tests/test_awsim_examples.py -q     # 7 passed (~7 s)
 - `compute_collision()` ignores `present_mask` (computes for all agents), so "removing" an
   agent by masking doesn't drop it from collisions — we freeze reached agents instead.
 - `Date.now`-style nondeterminism isn't relevant here; RNG is seeded via `np.random.default_rng`.
+- The progress line used to print `info` from the **last rollout step only**. `reached`
+  accumulates over an episode and resets with it, so with `rollout_steps=256` and
+  `max_steps=80` the sample point advanced 16 steps each update and cycled with period 5
+  (mean `reached` by `update % 5`: 0.00, 0.02, 0.42, 0.65, 0.67) — it looked like wild
+  instability and was pure logging phase. Goal-reaching is now averaged over the episodes
+  that finish inside the rollout, and collision/offroad over all rollout steps.
+- An invalid `WANDB_API_KEY` exported from `~/.bashrc` **shadows** a valid `wandb login`
+  (`~/.netrc`), and the failure reads as `CommError: user is not logged in`. Workaround:
+  `env -u WANDB_API_KEY uv run ...`.
+- `uv run` syncs the project env exactly, so anything installed with `uv pip install` is
+  removed on the next run. Example extras therefore live in `[dependency-groups] rl` with
+  `[tool.uv] default-groups = ["rl"]`. `pytest` is *not* in that group: the repo's
+  `[project.optional-dependencies] tests` pins `pytest==5.4.3`, which cannot even collect
+  under Python 3.13 — run tests via `uv run --with 'pytest>=8' pytest ...` until that pin
+  is fixed.
 
 ## Commit history (branch `claude/awsim-ll2-traffic-simulation-3de141`)
 
