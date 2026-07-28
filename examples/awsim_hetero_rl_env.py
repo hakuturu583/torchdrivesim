@@ -125,6 +125,10 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                                    dtype=torch.float32, device=device)
         sizes = np.stack([TYPE_SPEC[TYPES[t]]["size"] for t in self.agent_type_idx])
         self.agent_size = torch.tensor(sizes, dtype=torch.float32, device=device).unsqueeze(0)
+        # integer indices, not boolean masks: masked selection reads the count back from
+        # the device, and the three per-type metrics below cost 12 syncs a step that way
+        self._type_index = [ (self._type_idx_t == i).nonzero(as_tuple=True)[0]
+                             for i in range(len(TYPES)) ]
         self.type_onehot = torch.zeros(num_agents, len(TYPES), device=device)
         self.type_onehot[torch.arange(num_agents, device=device), self._type_idx_t] = 1.0
 
@@ -217,7 +221,9 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         """Put agent i on a fresh route once its own runs out at the edge of the map,
         keeping it clear of where the other agents currently are."""
         spec = TYPE_SPEC[TYPES[self.agent_type_idx[i]]]
-        xy = self._state()[:, :2].tolist()
+        # positions are pulled to the host once per batch of respawns, not once per
+        # agent: this used to be a full 512-agent device read inside the loop
+        xy = self._respawn_xy
         placed = [(px, py, 3.0) for j, (px, py) in enumerate(xy) if j != i]
         x, y, h, _, _, poly, end, s0 = self._sample_one(spec, placed)
         self._route_poly[i] = poly
@@ -310,19 +316,21 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         return self.type_onehot[nidx]
 
     def _post_physics(self):
+        # writing back unconditionally: the torch.equal guard that used to be here read
+        # the device every step purely to decide whether to skip a write that costs less
+        # than the synchronisation did
         state = self._state()
-        capped_v = torch.clamp(state[:, 3], -self.vmax, self.vmax)  # per-type top speed
-        if not torch.equal(capped_v, state[:, 3]):
-            new_state = state.clone(); new_state[:, 3] = capped_v
-            self.simulator.set_state(new_state.unsqueeze(0))
+        new_state = state.clone()
+        new_state[:, 3] = torch.clamp(state[:, 3], -self.vmax, self.vmax)  # per-type cap
+        self.simulator.set_state(new_state.unsqueeze(0))
 
     def _augment_info(self, info):
         sr = self._speed_ratio(self._state())
         for i, t in enumerate(TYPES):  # per-type goal-reaching
-            m = (self._type_idx_t == i)
-            info[f'reached_{t}'] = float(self._reached[m].float().mean()) if bool(m.any()) else 0.0
-            info[f'goals_{t}'] = float(self._goals_reached[m].mean()) if bool(m.any()) else 0.0
+            m = self._type_index[i]
+            info[f'reached_{t}'] = self._reached[m].float().mean()
+            info[f'goals_{t}'] = self._goals_reached[m].mean()
             # per type, because the mixed average hides which types have stopped: when
             # the wheeled agents parked, the overall ratio was 0.22 while pedestrians
             # were still at 0.53 of their limit
-            info[f'speed_{t}'] = float(sr[m].mean()) if bool(m.any()) else 0.0
+            info[f'speed_{t}'] = sr[m].mean()

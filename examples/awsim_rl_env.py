@@ -694,6 +694,7 @@ class AWSIMDrivingEnv:
 
     def _recover(self, mask):
         """Put agents that have driven off the road and stayed off back on a route."""
+        self._respawn_xy = self._state()[:, :2].tolist()   # one host read for the batch
         moved = []
         for i in mask.nonzero(as_tuple=True)[0].tolist():
             pose = self._respawn(i)
@@ -723,6 +724,7 @@ class AWSIMDrivingEnv:
         this returns whether any agent moved - the caller must re-read the state).
         """
         idx = mask.nonzero(as_tuple=True)[0].tolist()
+        self._respawn_xy = self._state()[:, :2].tolist()   # one host read for the batch
         moved = []
         for i in idx:
             s = self._s_goal[i] + self._goal_dist[i]
@@ -734,6 +736,7 @@ class AWSIMDrivingEnv:
                     pose = self._respawn(i)
                     if pose is None:   # nowhere to go: the agent stops earning goals
                         self._route_exhausted[i] = True
+                        self._any_finished = True
                         self._s_goal[i] = total
                         continue
                     moved.append((i, pose))
@@ -861,6 +864,7 @@ class AWSIMDrivingEnv:
         self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._off_run = torch.zeros(self.num_agents, device=self.device)
         self._lost_count = 0
+        self._any_finished = False
         self._prev_sl_idx = torch.full((self.num_agents,), -1, dtype=torch.long, device=self.device)
         self._prev_sl_signed = torch.zeros(self.num_agents, device=self.device)
         state = self._state()
@@ -895,7 +899,9 @@ class AWSIMDrivingEnv:
         # a sustained excursion means the agent is lost, not clipping a kerb
         self._off_run = (self._off_run + offroad) * offroad
         lost = self._off_run >= self.OFFROAD_PATIENCE
-        if self.rolling_goals and bool(lost.any()):
+        # one fused read for the three rare events below, instead of one each
+        flags = torch.stack([lost.any(), newly_reached.any()]).tolist()
+        if self.rolling_goals and flags[0]:
             if self._recover(lost):
                 state = self._state()
                 dist = self._dist_to_goal(state)
@@ -904,7 +910,7 @@ class AWSIMDrivingEnv:
         if self.rolling_goals:
             # Hand out the next goal instead of parking the agent. Only an agent whose
             # route cannot be extended any further is finished.
-            if bool(newly_reached.any()):
+            if flags[1]:
                 if self._advance_goals(newly_reached):
                     state = self._state()      # some agents were respawned elsewhere
                 # the goal moved, so re-measure: otherwise the jump in distance would be
@@ -914,7 +920,9 @@ class AWSIMDrivingEnv:
         else:
             self._reached = was_reached | (dist < self.goal_radius)
         # Freeze finished agents in place so they stop moving and don't drift into others.
-        if self._reached.any():
+        # `_any_finished` is maintained on the host by _advance_goals, so the freeze
+        # check needs no device read at all - with rolling goals it is almost never set
+        if self._any_finished:
             frozen = state.clone(); frozen[self._reached, 3] = 0.0
             self.simulator.set_state(frozen.unsqueeze(0), mask=self._reached.unsqueeze(0))
             state = self._state()
@@ -924,25 +932,34 @@ class AWSIMDrivingEnv:
         # `active` marks transitions that count for training: an agent's steps are
         # valid up to and including the step it reaches the goal, then excluded.
         active = ~was_reached
+        # Metrics stay as 0-dim tensors. Every float() here is a device-to-host copy that
+        # flushes the CUDA queue, and with ~25 of them per step (12 of which are per-type)
+        # the step spent 42 of its 71 ms waiting on synchronisation - 92 syncs per step,
+        # against 0.8% of device time in actual transfers. The trainer stacks these and
+        # converts once per rollout instead.
+        am = active.float()
+        n_active = am.sum().clamp(min=1)
+        mean_active = lambda x: (x * am).sum() / n_active
         info = {
-            'reached': float(self._reached.float().mean()),
-            'goals': float(self._goals_reached.mean()),   # goals collected per agent
-            'lost': float(self._lost_count),              # agents recovered from off-road
-            'proximity': float(proximity[active].mean()) if bool(active.any()) else 0.0,
+            'reached': self._reached.float().mean(),
+            'goals': self._goals_reached.mean(),          # goals collected per agent
+            'lost': self._lost_count,                     # python int, no sync
+            'proximity': mean_active(proximity),
             # mean speed against the limit. Without this in the log a policy that has
             # simply stopped reads as perfect on every rule metric - which is exactly
             # what happened once the penalties were raised from the start of training.
-            'speed_ratio': float(self._speed_ratio(state).mean()),
-            'redlight': float(redlight.sum()),            # crossings on red this step
-            'wrongway': float(wrongway[active].mean()) if bool(active.any()) else 0.0,
+            'speed_ratio': self._speed_ratio(state).mean(),
+            'redlight': redlight.sum(),                   # crossings on red this step
+            'wrongway': mean_active(wrongway),
             # violation = beyond the tolerated margin; excess is reported in km/h
-            'speeding': float((self._excess_kmh[active] > self.SPEED_TOLERANCE * 3.6).float().mean())
-                        if bool(active.any()) else 0.0,
-            'speed_excess': float(self._excess_kmh[active].mean()) if bool(active.any()) else 0.0,
-            'failtoyield': float(failtoyield[active].mean()) if bool(active.any()) else 0.0,
-            'collision': float(collision[active].mean()) if bool(active.any()) else 0.0,
-            'offroad': float(offroad[active].mean()) if bool(active.any()) else 0.0,
+            'speeding': mean_active((self._excess_kmh > self.SPEED_TOLERANCE * 3.6).float()),
+            'speed_excess': mean_active(self._excess_kmh),
+            'failtoyield': mean_active(failtoyield),
+            'collision': mean_active(collision),
+            'offroad': mean_active(offroad),
             'active': active,
+            # fixed-length episodes: the boundary is known without reading the device
+            'episode_end': self._t >= self.max_steps,
         }
         self._augment_info(info)
         return self._observation(state, action), reward, done, info

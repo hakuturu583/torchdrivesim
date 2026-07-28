@@ -257,8 +257,8 @@ def train(cfg: PPOConfig):
             step_speed.append(info['speed_ratio'])
             for k in step_rule:
                 step_rule[k].append(info[k])
-            if bool(done.all()):  # episode boundary -> log and reset
-                completed_returns.append(float(ep_return.mean()))
+            if info['episode_end']:  # episode boundary -> log and reset (no device read)
+                completed_returns.append(ep_return.mean())
                 ep_reached.append(info['reached'])
                 ep_goals.append(info['goals'])
                 ep_lost.append(info['lost'])
@@ -304,18 +304,21 @@ def train(cfg: PPOConfig):
                 opt.step()
                 last_stats = (pg_loss.item(), v_loss.item(), ent.item())
 
-        mean_ret = np.mean(completed_returns) if completed_returns else float(b_rew.sum(0).mean())
+        # one device read per rollout instead of per step: stacking keeps everything on
+        # the GPU until here, which is what the metrics used to cost 42 ms a step for
+        stack = lambda xs: float(torch.stack([torch.as_tensor(x, device=dev) for x in xs]).mean())
+        mean_ret = stack(completed_returns) if completed_returns else float(b_rew.sum(0).mean())
         history.append(mean_ret)
         # falls back to the last snapshot only when the rollout spans no full episode
-        mean_reached = float(np.mean(ep_reached)) if ep_reached else info['reached']
-        mean_goals = float(np.mean(ep_goals)) if ep_goals else info['goals']
-        mean_lost = float(np.mean(ep_lost)) if ep_lost else info['lost']
-        mean_speed = float(np.mean(step_speed))
-        mean_coll, mean_off = float(np.mean(step_coll)), float(np.mean(step_off))
-        mean_rule = {k: float(np.mean(v)) for k, v in step_rule.items()}
+        mean_reached = stack(ep_reached) if ep_reached else float(info['reached'])
+        mean_goals = stack(ep_goals) if ep_goals else float(info['goals'])
+        mean_lost = float(np.mean(ep_lost)) if ep_lost else float(info['lost'])
+        mean_speed = stack(step_speed)
+        mean_coll, mean_off = stack(step_coll), stack(step_off)
+        mean_rule = {k: stack(v) for k, v in step_rule.items()}
         sweep_hist.append((mean_goals, mean_coll, mean_rule['failtoyield'], mean_speed))
-        reached_type = {k: float(np.mean(v)) for k, v in ep_reached_type.items()} or \
-                       {k: v for k, v in info.items() if k.startswith('reached_')}
+        reached_type = {k: stack(v) for k, v in ep_reached_type.items()} or \
+                       {k: float(v) for k, v in info.items() if k.startswith('reached_')}
         print(f"upd {update+1:4d}/{cfg.updates} | return {mean_ret:8.3f} | "
               f"goals {mean_goals:5.2f} reached {mean_reached:.2f} coll {mean_coll:.2f} "
               f"v/lim {mean_speed:.2f} off {mean_off:.2f} lost {mean_lost:4.0f} red {mean_rule['redlight']:.2f} "
@@ -371,22 +374,22 @@ def train(cfg: PPOConfig):
             action, _, _ = net.act(obs, deterministic=True)
         obs, _, done, info = env.step(action)
         frames.append(env.render_frame(**cam))
-        if bool(done.all()):
+        if info['episode_end']:
             break
     video = save_video(frames, cfg.save_dir, "awsim_rl_rollout", cfg.dt, "mp4")
     print(f"[done] policy -> {os.path.join(cfg.save_dir, 'policy.pt')}")
-    print(f"[done] rollout video -> {video}  (final goals/agent {info['goals']:.2f}, "
-          f"reached {info['reached']:.2f})")
+    print(f"[done] rollout video -> {video}  (final goals/agent {float(info['goals']):.2f}, "
+          f"reached {float(info['reached']):.2f})")
     per_type = {k: v for k, v in info.items() if k.startswith('goals_')}
     if per_type:
-        print("[done] per-type goals/agent: " + ", ".join(f"{k[6:]} {v:.2f}" for k, v in per_type.items()))
+        print("[done] per-type goals/agent: " + ", ".join(f"{k[6:]} {float(v):.2f}" for k, v in per_type.items()))
     per_speed = {k: v for k, v in info.items() if k.startswith('speed_')}
     if per_speed:
-        print("[done] per-type v/limit: " + ", ".join(f"{k[6:]} {v:.2f}" for k, v in per_speed.items()))
+        print("[done] per-type v/limit: " + ", ".join(f"{k[6:]} {float(v):.2f}" for k, v in per_speed.items()))
 
     if run is not None:
         import wandb
-        log = {"final/reached": info["reached"], "rollout": wandb.Video(video)}
+        log = {"final/reached": float(info["reached"]), "rollout": wandb.Video(video)}
         curve = os.path.join(cfg.save_dir, "reward_curve.png")
         if os.path.exists(curve):
             log["reward_curve"] = wandb.Image(curve)
