@@ -100,6 +100,10 @@ class AWSIMDrivingEnv:
     W_YIELD = 0.5
     YIELD_RADIUS = 25.0              # metres; a priority agent nearer than this must be given way
     YIELD_SPEED = 1.0                # m/s; below this the agent counts as having stopped
+    # Right turns crossing oncoming traffic are the conflict the map does not describe
+    # and the signal phases cannot separate - see _add_oncoming_turn_priority.
+    TURN_CONFLICT_DIST = 3.0         # metres; how close two centrelines must come to conflict
+    TURN_CONFLICT_RADIUS = 60.0      # metres; only consider lanelets this near each other
     # vehicle vmax (14.0 m/s) sits a hair above the 50 km/h limit (13.89), so counting
     # any excess at all reports a full-speed car on a main road as a violation. Only
     # count a real margin, and report the magnitude separately.
@@ -262,6 +266,53 @@ class AWSIMDrivingEnv:
         self._priority = priority
         self._yield_lanelet = yields
         self._pt_lanelet = torch.tensor([order[ll.id] for ll in lanelets], device=self.device)
+        self._add_oncoming_turn_priority()
+
+    def _add_oncoming_turn_priority(self):
+        """Make right-turning lanelets give way to the oncoming traffic they cross.
+
+        The map does not describe this conflict: right_of_way marks 209 give-way
+        lanelets but never pairs a right turn with the oncoming lane it cuts across, and
+        the synthetic signal phases cannot separate them either - opposing approaches
+        are parallel, so they share a phase and are green together (228 of 460
+        same-phase stop-line pairs in a junction are head-on). Japan drives on the left,
+        so the right turn is the one that crosses; left turns conflict with the
+        crosswalk instead, which is deliberately left unregulated here.
+
+        The pairing is geometric - a right-turn centreline passing within
+        TURN_CONFLICT_DIST of an oncoming centreline - rather than taken from
+        turn_direction alone, so it only fires where the paths actually cross.
+        """
+        order = self._lanelet_order
+        lls = [ll for ll in self.lanelet_map.laneletLayer if ll.id in order]
+        pts, head, cent = {}, {}, {}
+        for ll in lls:
+            a = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64)
+            if a.shape[0] < 2:
+                continue
+            pts[ll.id] = a
+            d = a[-1] - a[0]
+            head[ll.id] = np.arctan2(d[1], d[0])
+            cent[ll.id] = a.mean(axis=0)
+        right = [ll.id for ll in lls if 'turn_direction' in ll.attributes
+                 and ll.attributes['turn_direction'] == 'right' and ll.id in pts]
+        added = 0
+        for r in right:
+            for o in pts:
+                if o == r:
+                    continue
+                if np.hypot(*(cent[o] - cent[r])) > self.TURN_CONFLICT_RADIUS:
+                    continue
+                if np.cos(head[o] - head[r]) > -0.3:          # not oncoming
+                    continue
+                gap = np.linalg.norm(pts[r][:, None, :] - pts[o][None, :, :], axis=-1).min()
+                if gap < self.TURN_CONFLICT_DIST:
+                    self._priority[order[r], order[o]] = True
+                    self._yield_lanelet[order[r]] = True
+                    added += 1
+        if right and not added:
+            raise RuntimeError('right-turn lanelets found but no oncoming conflicts paired')
+        self._turn_priority_pairs = added
 
     def _agent_lanelet(self, state):
         """Index (into the right-of-way tables) of the lanelet each agent is on."""
