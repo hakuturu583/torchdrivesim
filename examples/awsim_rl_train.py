@@ -79,6 +79,8 @@ class PPOConfig:
     w_wrongway: float = 0.2
     w_speeding: float = 0.6
     w_yield: float = 0.5
+    w_proximity: float = 0.3
+    ttc_threshold: float = 3.0
     # Rule penalties ramp in over the first `penalty_warmup` updates, from
     # `penalty_warmup_start` of their value to full. Applied from the start they punish
     # driving before the policy can drive, and standing still - a safe zero - wins:
@@ -195,7 +197,8 @@ def train(cfg: PPOConfig):
                   w_progress=cfg.w_progress, w_goal=cfg.w_goal,
                   w_offroad=cfg.w_offroad, w_collision=cfg.w_collision,
                   w_redlight=cfg.w_redlight, w_wrongway=cfg.w_wrongway,
-                  w_speeding=cfg.w_speeding, w_yield=cfg.w_yield)
+                  w_speeding=cfg.w_speeding, w_yield=cfg.w_yield,
+                  w_proximity=cfg.w_proximity, ttc_threshold=cfg.ttc_threshold)
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
                       env.MAX_ROAD, env.ROAD_FEATURES, ad, cfg.hidden,
@@ -227,7 +230,8 @@ def train(cfg: PPOConfig):
         if cfg.penalty_warmup > 0:
             f = min(1.0, cfg.penalty_warmup_start + (1 - cfg.penalty_warmup_start)
                     * update / cfg.penalty_warmup)
-            for k in ('offroad', 'collision', 'redlight', 'wrongway', 'speeding', 'yield'):
+            for k in ('offroad', 'collision', 'redlight', 'wrongway', 'speeding', 'yield',
+                      'proximity'):
                 setattr(env, f'w_{k}', getattr(cfg, f'w_{k}') * f)
         # `info` is a snapshot of the step it came from: `reached` accumulates over an
         # episode and resets with it, so reading it off the last rollout step samples a
@@ -237,7 +241,7 @@ def train(cfg: PPOConfig):
         # infraction rates are averaged over the whole rollout.
         ep_reached, ep_reached_type, ep_goals, ep_lost = [], {}, [], []
         step_speed = []
-        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': []}
+        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': []}
 
         for t in range(cfg.rollout_steps):
             with torch.no_grad():
@@ -315,7 +319,7 @@ def train(cfg: PPOConfig):
         print(f"upd {update+1:4d}/{cfg.updates} | return {mean_ret:8.3f} | "
               f"goals {mean_goals:5.2f} reached {mean_reached:.2f} coll {mean_coll:.2f} "
               f"v/lim {mean_speed:.2f} off {mean_off:.2f} lost {mean_lost:4.0f} red {mean_rule['redlight']:.2f} "
-              f"wrong {mean_rule['wrongway']:.2f} spd {mean_rule['speeding']:.2f}"
+              f"prox {mean_rule['proximity']:.3f} wrong {mean_rule['wrongway']:.2f} spd {mean_rule['speeding']:.2f}"
               f"/{mean_rule['speed_excess']:.2f} yld {mean_rule['failtoyield']:.3f} | "
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:

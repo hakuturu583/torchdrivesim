@@ -73,7 +73,11 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  spawn_attempts=25, spawn_gap=1.5, pool_cap=120,
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
                  rolling_goals=None, goal_dist=None,
-                 w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None):
+                 w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
+                 w_proximity=None, ttc_threshold=None):
+        self.w_proximity = self.W_PROXIMITY if w_proximity is None else w_proximity
+        if ttc_threshold is not None:
+            self.TTC_THRESHOLD = ttc_threshold
         self.w_yield = self.W_YIELD if w_yield is None else w_yield
         self.w_redlight = self.W_REDLIGHT if w_redlight is None else w_redlight
         self.w_wrongway = self.W_WRONGWAY if w_wrongway is None else w_wrongway

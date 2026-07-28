@@ -45,9 +45,15 @@ class AWSIMDrivingEnv:
 
     ACT_DIM = 2
     EGO_DIM = 15              # speed, goal, prev action, signal (5), limit, must-yield
-    MAX_PARTNERS = 8          # K nearest neighbours observed
+    MAX_PARTNERS = 16         # K nearest neighbours observed
     PARTNER_FEATURES = 8      # rel_x/y, width, length, rel_head_cos/sin, rel_speed, has_priority
-    VIEW_RADIUS = 30.0        # metres; neighbours beyond this are not observed
+    # 30 m was shorter than the braking distance of the faster agents: a motorcycle at
+    # its 65 km/h vmax needs 32.4 m to stop at 5 m/s^2, so 53% of its collisions were
+    # already unavoidable at the moment the partner first became observable. Widening the
+    # radius alone would not have helped - with 6.9 neighbours inside 30 m on average, the
+    # 8 nearest slots were filled by close agents and the distant one still never appeared
+    # - so MAX_PARTNERS goes up with it.
+    VIEW_RADIUS = 60.0        # metres; neighbours beyond this are not observed
     MAX_ROAD = 10             # K nearest road-graph points observed
     ROAD_FEATURES = 4         # rel_x, rel_y, rel_dir_cos, rel_dir_sin
     ROAD_RADIUS = 30.0        # metres; road points beyond this are not observed
@@ -83,6 +89,14 @@ class AWSIMDrivingEnv:
     # through was strictly cheaper than yielding and the collision rate never moved
     # across four runs. Same shape as the speeding weight; see W_SPEEDING.
     W_COLLISION = 0.6
+    # Contact-only penalties give no gradient before contact: relu(1 - d/(r_i+r_j)) is
+    # exactly zero while the agents are apart, so "too close" costs nothing. Measured,
+    # 65% of collisions were still avoidable by braking when the partner first became
+    # visible, and the mean throttle from first sight to impact was +1.2 - the policy
+    # accelerates into agents it can see. This penalises closing time instead, so the
+    # signal exists before the boxes overlap.
+    W_PROXIMITY = 0.3
+    TTC_THRESHOLD = 3.0              # seconds; closing faster than this starts to cost
 
     # Rolling goals: instead of parking an agent at its single goal, the next goal is
     # placed GOAL_DIST further along the same route, and the route is extended through
@@ -135,7 +149,11 @@ class AWSIMDrivingEnv:
                  goal_radius=3.0, render_fov=None, render_res=512, seed=0,
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
                  rolling_goals=None, goal_dist=None,
-                 w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None):
+                 w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
+                 w_proximity=None, ttc_threshold=None):
+        self.w_proximity = self.W_PROXIMITY if w_proximity is None else w_proximity
+        if ttc_threshold is not None:
+            self.TTC_THRESHOLD = ttc_threshold
         self.w_yield = self.W_YIELD if w_yield is None else w_yield
         self.w_redlight = self.W_REDLIGHT if w_redlight is None else w_redlight
         self.w_wrongway = self.W_WRONGWAY if w_wrongway is None else w_wrongway
@@ -449,6 +467,30 @@ class AWSIMDrivingEnv:
         feat = torch.cat([has.float().unsqueeze(1),
                           (signed / self.TL_RADIUS).clamp(0, 1).unsqueeze(1), onehot], dim=-1)
         return idx, signed, feat
+
+    def _proximity(self, state):
+        """Per-agent penalty on the shortest time-to-collision with any neighbour.
+
+        Time rather than distance because the margin a pedestrian needs and the margin a
+        motorcycle needs differ by an order of magnitude, and a fixed distance would be
+        both too much for one and too little for the other.
+        """
+        A = state.shape[0]
+        xy, psi, v = state[:, :2], state[:, 2], state[:, 3]
+        vel = torch.stack([torch.cos(psi), torch.sin(psi)], dim=-1) * v.unsqueeze(-1)
+        rel = xy.unsqueeze(0) - xy.unsqueeze(1)                     # [A, A, 2] j - i
+        dist = rel.norm(dim=-1)
+        u = rel / dist.clamp(min=1e-6).unsqueeze(-1)
+        closing = ((vel.unsqueeze(1) - vel.unsqueeze(0)) * u).sum(-1)   # >0 = approaching
+        size = self.simulator.get_agent_size()[0][..., :2]
+        radius = 0.5 * size.max(dim=-1).values
+        gap = (dist - radius.unsqueeze(0) - radius.unsqueeze(1)).clamp(min=0)
+        ttc = torch.where(closing > 0.1, gap / closing.clamp(min=0.1),
+                          torch.full_like(gap, float('inf')))
+        ttc.fill_diagonal_(float('inf'))
+        mask = self.simulator.get_present_mask()[0]
+        ttc = torch.where(mask.unsqueeze(0), ttc, torch.full_like(ttc, float('inf')))
+        return torch.relu(1 - ttc.min(dim=1).values / self.TTC_THRESHOLD) * mask
 
     def _speed_ratio(self, state):
         """Per-agent speed as a fraction of the limit where it is. Reported because
@@ -839,6 +881,7 @@ class AWSIMDrivingEnv:
         progress = (self._prev_dist - dist)                                   # dense shaping
         collision = (self._collision(state) > 0).float()
         offroad = (self._offroad(state) > 0).float()
+        proximity = self._proximity(state)
         progress = progress * (1.0 - offroad)      # no credit for shortcutting off-road
         redlight, wrongway, speeding, failtoyield = self._rule_violations(state)
         newly_reached = (dist < self.goal_radius) & (~was_reached)
@@ -846,7 +889,7 @@ class AWSIMDrivingEnv:
                   - self.w_offroad * offroad + self.w_goal * newly_reached.float()
                   - self.w_redlight * redlight - self.w_wrongway * wrongway
                   - self.w_speeding * speeding            # see W_SPEEDING
-                  - self.w_yield * failtoyield)
+                  - self.w_yield * failtoyield - self.w_proximity * proximity)
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
         # a sustained excursion means the agent is lost, not clipping a kerb
@@ -885,6 +928,7 @@ class AWSIMDrivingEnv:
             'reached': float(self._reached.float().mean()),
             'goals': float(self._goals_reached.mean()),   # goals collected per agent
             'lost': float(self._lost_count),              # agents recovered from off-road
+            'proximity': float(proximity[active].mean()) if bool(active.any()) else 0.0,
             # mean speed against the limit. Without this in the log a policy that has
             # simply stopped reads as perfect on every rule metric - which is exactly
             # what happened once the penalties were raised from the start of training.
