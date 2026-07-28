@@ -85,7 +85,17 @@ class AWSIMDrivingEnv:
     INTERSECTION_RADIUS = 40.0       # metres; stop lines within this share a junction
     W_REDLIGHT = 0.5                 # penalty for crossing a stop line on red
     W_WRONGWAY = 0.2                 # penalty per step against the lane direction
-    W_SPEEDING = 0.2                 # penalty per step scaled by the excess over the limit
+    # Speeding: the penalty is w * (v - limit) / limit and the progress it buys is
+    # w_progress * (v - limit) * dt, so compliance beats speeding by
+    #     w_speeding / (w_progress * dt * limit)
+    # - independent of how far over the agent is, and *weakest on fast roads*. At the
+    # map's most common 50 km/h that ratio is only 1.4 with w=0.2, which PPO reads as a
+    # near-tie; 0.6 makes it ~4.3.
+    W_SPEEDING = 0.6
+    # vehicle vmax (14.0 m/s) sits a hair above the 50 km/h limit (13.89), so counting
+    # any excess at all reports a full-speed car on a main road as a violation. Only
+    # count a real margin, and report the magnitude separately.
+    SPEEDING_TOLERANCE = 0.05
 
     def __init__(self, map_path, num_agents=8, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, render_fov=None, render_res=512, seed=0,
@@ -680,7 +690,9 @@ class AWSIMDrivingEnv:
             'goals': float(self._goals_reached.mean()),   # goals collected per agent
             'redlight': float(redlight.sum()),            # crossings on red this step
             'wrongway': float(wrongway[active].mean()) if bool(active.any()) else 0.0,
-            'speeding': float((speeding[active] > 0).float().mean()) if bool(active.any()) else 0.0,
+            'speeding': float((speeding[active] > self.SPEEDING_TOLERANCE).float().mean())
+                        if bool(active.any()) else 0.0,
+            'speed_excess': float(speeding[active].mean()) if bool(active.any()) else 0.0,
             'collision': float(collision[active].mean()) if bool(active.any()) else 0.0,
             'offroad': float(offroad[active].mean()) if bool(active.any()) else 0.0,
             'active': active,
