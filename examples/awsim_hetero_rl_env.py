@@ -72,7 +72,11 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  goal_radius=3.0, mix=None, render_fov=None, render_res=512, seed=0,
                  spawn_attempts=25, spawn_gap=1.5, pool_cap=120,
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
-                 rolling_goals=None, goal_dist=None):
+                 rolling_goals=None, goal_dist=None,
+                 w_redlight=None, w_wrongway=None, w_speeding=None):
+        self.w_redlight = self.W_REDLIGHT if w_redlight is None else w_redlight
+        self.w_wrongway = self.W_WRONGWAY if w_wrongway is None else w_wrongway
+        self.w_speeding = self.W_SPEEDING if w_speeding is None else w_speeding
         # goal_dist is per type here (TYPE_SPEC), so the scalar override is ignored
         self.rolling_goals = self.ROLLING_GOALS if rolling_goals is None else rolling_goals
         self.default_goal_dist = self.GOAL_DIST if goal_dist is None else goal_dist
@@ -99,6 +103,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self._center, default_fov = mesh_camera(self.mesh)
         self.render_fov = render_fov if render_fov is not None else default_fov
         self._build_road_graph()
+        self._build_traffic_lights()
         self._build_offroad_index()
 
         # fixed per-agent type + derived static properties

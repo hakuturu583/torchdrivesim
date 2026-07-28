@@ -44,7 +44,7 @@ class AWSIMDrivingEnv:
     """
 
     ACT_DIM = 2
-    EGO_DIM = 8               # ego features (speed, goal, prev action)
+    EGO_DIM = 14              # speed, goal, prev action, signal (5), speed limit
     MAX_PARTNERS = 8          # K nearest neighbours observed
     PARTNER_FEATURES = 7      # rel_x, rel_y, width, length, rel_head_cos/sin, rel_speed
     VIEW_RADIUS = 30.0        # metres; neighbours beyond this are not observed
@@ -74,10 +74,26 @@ class AWSIMDrivingEnv:
     GOAL_DIST = 150.0
     ROLLING_GOALS = True
 
+    # Traffic rules read off the map: per-lanelet speed limits, and the stop lines of
+    # traffic_light regulatory elements. Every rule below is BOTH observed (in
+    # _ego_features) and rewarded - a penalty for something the agent cannot perceive
+    # is not a hard task, it is an unlearnable one.
+    DEFAULT_SPEED_LIMIT = 50 / 3.6   # m/s, for lanelets with no speed_limit tag
+    TL_CYCLE = 20.0                  # seconds per full signal cycle
+    TL_RADIUS = 60.0                 # metres; stop lines beyond this are not observed
+    INTERSECTION_RADIUS = 40.0       # metres; stop lines within this share a junction
+    W_REDLIGHT = 0.5                 # penalty for crossing a stop line on red
+    W_WRONGWAY = 0.2                 # penalty per step against the lane direction
+    W_SPEEDING = 0.2                 # penalty per step scaled by the excess over the limit
+
     def __init__(self, map_path, num_agents=8, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, render_fov=None, render_res=512, seed=0,
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
-                 rolling_goals=None, goal_dist=None):
+                 rolling_goals=None, goal_dist=None,
+                 w_redlight=None, w_wrongway=None, w_speeding=None):
+        self.w_redlight = self.W_REDLIGHT if w_redlight is None else w_redlight
+        self.w_wrongway = self.W_WRONGWAY if w_wrongway is None else w_wrongway
+        self.w_speeding = self.W_SPEEDING if w_speeding is None else w_speeding
         self.rolling_goals = self.ROLLING_GOALS if rolling_goals is None else rolling_goals
         self.default_goal_dist = self.GOAL_DIST if goal_dist is None else goal_dist
         self.w_progress = self.W_PROGRESS if w_progress is None else w_progress
@@ -100,6 +116,7 @@ class AWSIMDrivingEnv:
         self._center, default_fov = mesh_camera(self.mesh)
         self.render_fov = render_fov if render_fov is not None else default_fov
         self._build_road_graph()
+        self._build_traffic_lights()
         self._build_offroad_index()
 
         # --- lane-following routes -> start states + goals ---
@@ -132,21 +149,164 @@ class AWSIMDrivingEnv:
         self.reset()
 
     def _build_road_graph(self):
-        """Sample lane centrelines into a point cloud (x, y, heading) used for the
-        road-graph observation, mirroring GPUDrive's road-segment observations."""
-        xy, hdg = [], []
+        """Sample lane centrelines into a point cloud (x, y, heading, speed limit) used
+        for the road-graph observation, mirroring GPUDrive's road-segment observations.
+        The heading also gives the legal direction of travel (wrong-way detection) and
+        the speed limit the legal speed, both looked up via the nearest point."""
+        xy, hdg, lim = [], [], []
         for ll in self.lanelet_map.laneletLayer:
+            # every lanelet in the AWSIM map carries speed_limit, in km/h
+            v = float(ll.attributes['speed_limit']) / 3.6 if 'speed_limit' in ll.attributes \
+                else self.DEFAULT_SPEED_LIMIT
             pts = [(p.x, p.y) for p in ll.centerline]
             for a, b in zip(pts[:-1], pts[1:]):
                 xy.append(a)
                 hdg.append(np.arctan2(b[1] - a[1], b[0] - a[0]))
+                lim.append(v)
         xy = np.asarray(xy, dtype=np.float32)
         hdg = np.asarray(hdg, dtype=np.float32)
+        lim = np.asarray(lim, dtype=np.float32)
         if xy.shape[0] > self.ROAD_POINT_CAP:  # subsample to bound the nearest-point query
             sel = self._rng.choice(xy.shape[0], self.ROAD_POINT_CAP, replace=False)
-            xy, hdg = xy[sel], hdg[sel]
+            xy, hdg, lim = xy[sel], hdg[sel], lim[sel]
         self._road_xy = torch.tensor(xy, device=self.device)          # [M, 2]
         self._road_dir = torch.tensor(hdg, device=self.device)        # [M]
+        self._road_speed = torch.tensor(lim, device=self.device)      # [M] m/s
+
+    # -------------------------------------------------------- traffic lights
+    def _build_traffic_lights(self):
+        """Stop lines of the map's traffic_light regulatory elements, grouped into
+        intersections and split into two alternating phase groups.
+
+        Caveat: the map stores the geometry, not a signal plan, so the phases here are
+        synthetic - a fixed cycle per intersection with the two roughly perpendicular
+        approach groups in antiphase. That is enough to require stopping and to make
+        crossing traffic mutually exclusive, but it is not Autoware's real signal logic.
+        """
+        seen, sig = {}, []
+        for ll in self.lanelet_map.laneletLayer:
+            for r in ll.regulatoryElements:
+                if 'subtype' not in r.attributes or r.attributes['subtype'] != 'traffic_light':
+                    continue
+                if r.id in seen:
+                    continue
+                try:
+                    line = r.stopLine
+                    if line is None:
+                        continue
+                    pts = [(q.x, q.y) for q in line]
+                except Exception:
+                    continue
+                if len(pts) < 1:
+                    continue
+                mid = np.mean(np.asarray(pts, dtype=np.float64), axis=0)
+                cl = [(q.x, q.y) for q in ll.centerline]           # approach direction
+                if len(cl) < 2:
+                    continue
+                a, b = np.asarray(cl[-2]), np.asarray(cl[-1])
+                seen[r.id] = len(sig)
+                sig.append((mid[0], mid[1], float(np.arctan2(b[1] - a[1], b[0] - a[0]))))
+        if not sig:
+            self._sl_xy = torch.zeros(0, 2, device=self.device)
+            self._sl_dir = torch.zeros(0, device=self.device)
+            self._sl_group = torch.zeros(0, dtype=torch.long, device=self.device)
+            self._sl_offset = torch.zeros(0, dtype=torch.long, device=self.device)
+            return
+        sig = np.asarray(sig, dtype=np.float64)
+
+        # greedy spatial clustering of stop lines into intersections
+        cluster, centres = np.full(len(sig), -1), []
+        for i, (x, y, _) in enumerate(sig):
+            for c, (cx, cy) in enumerate(centres):
+                if (x - cx) ** 2 + (y - cy) ** 2 < self.INTERSECTION_RADIUS ** 2:
+                    cluster[i] = c
+                    break
+            else:
+                cluster[i] = len(centres)
+                centres.append((x, y))
+
+        # within an intersection, approaches roughly parallel to the first one share a
+        # phase; the roughly perpendicular ones get the opposite phase
+        group = np.zeros(len(sig), dtype=np.int64)
+        offset = np.zeros(len(sig), dtype=np.int64)
+        period = max(int(round(self.TL_CYCLE / self.dt)), 2)
+        for c in range(len(centres)):
+            members = np.flatnonzero(cluster == c)
+            ref = sig[members[0], 2]
+            group[members] = (np.abs(np.cos(sig[members, 2] - ref)) < 0.5).astype(np.int64)
+            offset[members] = int(self._rng.integers(period))   # desynchronise junctions
+        self._sl_xy = torch.tensor(sig[:, :2], dtype=torch.float32, device=self.device)
+        self._sl_dir = torch.tensor(sig[:, 2], dtype=torch.float32, device=self.device)
+        self._sl_group = torch.tensor(group, device=self.device)
+        self._sl_offset = torch.tensor(offset, device=self.device)
+
+    def _light_state(self):
+        """0 = red, 1 = amber, 2 = green, for every stop line at the current step."""
+        period = max(int(round(self.TL_CYCLE / self.dt)), 2)
+        phase = (self._t + self._sl_offset + self._sl_group * (period // 2)) % period
+        green = (phase < int(period * 0.42))
+        amber = (~green) & (phase < period // 2)
+        return torch.where(green, 2, torch.where(amber, 1, 0))
+
+    def _signals(self, state):
+        """For each agent, the stop line it is approaching (if any) within TL_RADIUS:
+        returns (index or -1, signed distance along the agent's heading, features)."""
+        A = state.shape[0]
+        if self._sl_xy.shape[0] == 0:
+            return (torch.full((A,), -1, dtype=torch.long, device=self.device),
+                    torch.zeros(A, device=self.device), torch.zeros(A, 5, device=self.device))
+        psi = state[:, 2]
+        fwd = torch.stack([torch.cos(psi), torch.sin(psi)], dim=-1)     # [A, 2]
+        rel = self._sl_xy.unsqueeze(0) - state[:, :2].unsqueeze(1)      # [A, S, 2]
+        ahead = (rel * fwd.unsqueeze(1)).sum(-1)                        # [A, S] signed
+        dist = rel.norm(dim=-1)
+        # only a stop line in front, within range, and facing the way the agent drives
+        aligned = torch.cos(psi.unsqueeze(1) - self._sl_dir.unsqueeze(0)) > 0.5
+        valid = aligned & (ahead > 0) & (dist < self.TL_RADIUS)
+        pick = torch.where(valid, dist, torch.full_like(dist, float('inf'))).min(dim=1)
+        has = torch.isfinite(pick.values)
+        idx = torch.where(has, pick.indices, torch.full_like(pick.indices, -1))
+        signed = torch.where(has, ahead.gather(1, pick.indices.unsqueeze(1)).squeeze(1),
+                             torch.zeros(A, device=self.device))
+        colour = self._light_state()[pick.indices.clamp(min=0)]
+        onehot = torch.nn.functional.one_hot(colour, 3).float() * has.unsqueeze(1).float()
+        feat = torch.cat([has.float().unsqueeze(1),
+                          (signed / self.TL_RADIUS).clamp(0, 1).unsqueeze(1), onehot], dim=-1)
+        return idx, signed, feat
+
+    def _rule_violations(self, state):
+        """Red-light crossings, wrong-way driving and speeding, as [A] tensors.
+
+        A red-light violation is the moment an agent passes the stop line it was
+        approaching while that light is red, so it is detected against the stop line
+        selected on the *previous* step - once crossed, the stop line is behind the
+        agent and is no longer selected.
+        """
+        A = state.shape[0]
+        psi = state[:, 2]
+        fwd = torch.stack([torch.cos(psi), torch.sin(psi)], dim=-1)
+        idx, signed, _ = self._signals(state)
+
+        redlight = torch.zeros(A, device=self.device)
+        if self._sl_xy.shape[0] > 0:
+            prev = self._prev_sl_idx
+            had = prev >= 0
+            pidx = prev.clamp(min=0)
+            now_signed = ((self._sl_xy[pidx] - state[:, :2]) * fwd).sum(-1)
+            crossed = had & (self._prev_sl_signed > 0) & (now_signed <= 0)
+            redlight = (crossed & (self._light_state()[pidx] == 0)).float()
+        self._prev_sl_idx, self._prev_sl_signed = idx, signed
+
+        near = self._nearest_road(state)
+        # heading against the lane direction by more than 90 degrees
+        wrongway = (torch.cos(psi - self._road_dir[near]) < 0).float()
+        limit = self._road_speed[near]
+        speeding = (state[:, 3].abs() - limit).clamp(min=0) / limit
+        return redlight, wrongway, speeding
+
+    def _nearest_road(self, state):
+        """Index of the nearest lane-centreline point for each agent."""
+        return torch.cdist(state[:, :2], self._road_xy).argmin(dim=1)
 
     # ------------------------------------------------------------- offroad
     # `Simulator.compute_offroad` (without pytorch3d) expands the *whole* driving
@@ -307,6 +467,7 @@ class AWSIMDrivingEnv:
             for i, (x, y, h) in moved:
                 state[i, 0], state[i, 1], state[i, 2], state[i, 3] = x, y, h, 0.0
                 m[i] = True
+                self._prev_sl_idx[i] = -1
             self.simulator.set_state(state.unsqueeze(0), mask=m.unsqueeze(0))
         return bool(moved)
 
@@ -319,19 +480,23 @@ class AWSIMDrivingEnv:
 
     def _ego_features(self, state, prev_action):
         x, y, psi, v = state[:, 0], state[:, 1], state[:, 2], state[:, 3]
+        limit = self._road_speed[self._nearest_road(state)]
         dx, dy = self.goals[:, 0] - x, self.goals[:, 1] - y
         c, s = torch.cos(psi), torch.sin(psi)
         gx_e = c * dx + s * dy            # goal in ego frame
         gy_e = -s * dx + c * dy
         dist = torch.linalg.norm(torch.stack([dx, dy], -1), dim=-1)
         head_err = torch.atan2(gy_e, gx_e)
-        return torch.stack([
+        base = torch.stack([
             v / 10.0,
             dist.clamp(max=100.0) / 50.0,
             torch.cos(head_err), torch.sin(head_err),
             (gx_e / 50.0).clamp(-2, 2), (gy_e / 50.0).clamp(-2, 2),
             prev_action[:, 0], prev_action[:, 1],
+            limit / 10.0,
         ], dim=-1)
+        # the signal block is what makes the red-light penalty learnable
+        return torch.cat([base, self._signals(state)[2]], dim=-1)
 
     def _partner_extra(self, nidx, valid):
         """Optional extra per-neighbour features (e.g. type one-hot). None in base."""
@@ -415,6 +580,8 @@ class AWSIMDrivingEnv:
         self._reached = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._goals_reached = torch.zeros(self.num_agents, device=self.device)
         self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
+        self._prev_sl_idx = torch.full((self.num_agents,), -1, dtype=torch.long, device=self.device)
+        self._prev_sl_signed = torch.zeros(self.num_agents, device=self.device)
         state = self._state()
         self._prev_dist = self._dist_to_goal(state)
         return self._observation(state, self._prev_action)
@@ -433,9 +600,12 @@ class AWSIMDrivingEnv:
         progress = (self._prev_dist - dist)                                   # dense shaping
         collision = (self._collision(state) > 0).float()
         offroad = (self._offroad(state) > 0).float()
+        redlight, wrongway, speeding = self._rule_violations(state)
         newly_reached = (dist < self.goal_radius) & (~was_reached)
         reward = (self.w_progress * progress - self.w_collision * collision
-                  - self.w_offroad * offroad + self.w_goal * newly_reached.float())
+                  - self.w_offroad * offroad + self.w_goal * newly_reached.float()
+                  - self.w_redlight * redlight - self.w_wrongway * wrongway
+                  - self.w_speeding * speeding)
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
         self._goals_reached += newly_reached.float()
@@ -465,6 +635,9 @@ class AWSIMDrivingEnv:
         info = {
             'reached': float(self._reached.float().mean()),
             'goals': float(self._goals_reached.mean()),   # goals collected per agent
+            'redlight': float(redlight.sum()),            # crossings on red this step
+            'wrongway': float(wrongway[active].mean()) if bool(active.any()) else 0.0,
+            'speeding': float((speeding[active] > 0).float().mean()) if bool(active.any()) else 0.0,
             'collision': float(collision[active].mean()) if bool(active.any()) else 0.0,
             'offroad': float(offroad[active].mean()) if bool(active.any()) else 0.0,
             'active': active,

@@ -249,6 +249,39 @@ Caveats, in order of importance:
   relative to the progress term.
 - **Pedestrians barely function** (reached 0.03) — see limitation 3 below.
 
+## Traffic rules from the map
+
+The map carries far more than the drivable surface: 282 traffic_light regulatory
+elements (163 distinct stop lines), 207 stop_line linestrings, 85 right_of_way, 451
+traffic_sign, and a `speed_limit` on all 979 lanelets (5-50 km/h). The env now uses:
+
+- **Speed limits** - attached to each lane-centreline point, looked up by nearest point;
+  penalised as excess over the limit (`w_speeding`).
+- **Wrong-way** - heading against the nearest lane point's direction (`w_wrongway`).
+- **Red lights** - crossing the stop line the agent was approaching while it is red
+  (`w_redlight`). Stop lines are clustered into junctions (`INTERSECTION_RADIUS`) and
+  split into two antiphase groups by approach heading.
+
+**The map stores geometry, not a signal plan**, so the phases are synthetic: a fixed
+`TL_CYCLE` per junction with a seeded offset, crossing approaches in antiphase. Enough to
+require stopping and to make conflicting movements mutually exclusive, but it is not
+Autoware's signal logic; `right_of_way` and `traffic_sign` are still unused.
+
+Every one of these is in the observation as well as the reward (5 signal features + the
+speed limit, EGO_DIM 8 -> 14). That is deliberate: the pedestrian bug below is what
+happens when a reward depends on something the agent cannot perceive.
+
+Measured with a fixed "accelerate" policy, 250-step episodes:
+
+```
+A= 256   15.4 ms/step   red-light crossings 173/ep   wrong-way 0.39   speeding 0.35   collision 0.013
+A=1024   83.7 ms/step   red-light crossings 685/ep   wrong-way 0.35   speeding 0.35   collision 0.116
+```
+
+Density matters more than it looks: 256 agents on 41.7 km of lane is one per 163 m, and
+the collision rate is 9x higher at 1024. A low collision rate at 256 agents means the
+agents rarely meet, not that they negotiate well.
+
 ## Known limitations / open issues (good first tasks on GPU)
 
 1. ~~**Under-trained on CPU.**~~ Done — see the GPU run above. The open question is no
