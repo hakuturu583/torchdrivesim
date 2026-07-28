@@ -103,6 +103,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self._center, default_fov = mesh_camera(self.mesh)
         self.render_fov = render_fov if render_fov is not None else default_fov
         self._build_road_graph()
+        self._build_rule_lookup()
         self._build_traffic_lights()
         self._build_offroad_index()
 
@@ -124,6 +125,22 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
 
         self._build_spawn_pools()
         self.reset()
+
+    def _rule_participant_mask(self, lanelets):
+        """Each type may only be matched to lane points of lanelets its lanelet2
+        participant can pass, so a pedestrian on a crosswalk is not judged against the
+        road running under it."""
+        mask = torch.zeros(len(TYPES), len(lanelets), dtype=torch.bool, device=self.device)
+        for i, t in enumerate(TYPES):
+            rules = self._traffic_rules(TYPE_SPEC[t]["participant"])
+            ok = {ll.id: rules.canPass(ll) for ll in set(lanelets)}
+            mask[i] = torch.tensor([ok[ll.id] for ll in lanelets], device=self.device)
+            if not bool(mask[i].any()):       # participant has no surface of its own
+                mask[i] = True
+        return mask
+
+    def _agent_types(self):
+        return self._type_idx_t
 
     # ------------------------------------------------------ spawn machinery
     def _allocate(self, n, mix):

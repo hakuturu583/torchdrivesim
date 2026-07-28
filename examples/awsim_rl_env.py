@@ -52,6 +52,7 @@ class AWSIMDrivingEnv:
     ROAD_FEATURES = 4         # rel_x, rel_y, rel_dir_cos, rel_dir_sin
     ROAD_RADIUS = 30.0        # metres; road points beyond this are not observed
     ROAD_POINT_CAP = 2000     # subsample the lane-centreline point cloud to this many
+                              # (observation only - rules use the dense table below)
     OBS_DIM = EGO_DIM + MAX_PARTNERS * PARTNER_FEATURES + MAX_ROAD * ROAD_FEATURES
     NUM_TYPES = 1             # single agent type -> single policy head
     TYPE_ONEHOT_SLICE = None  # (start, end) of the ego type one-hot in the obs, if any
@@ -116,6 +117,7 @@ class AWSIMDrivingEnv:
         self._center, default_fov = mesh_camera(self.mesh)
         self.render_fov = render_fov if render_fov is not None else default_fov
         self._build_road_graph()
+        self._build_rule_lookup()
         self._build_traffic_lights()
         self._build_offroad_index()
 
@@ -172,6 +174,44 @@ class AWSIMDrivingEnv:
         self._road_xy = torch.tensor(xy, device=self.device)          # [M, 2]
         self._road_dir = torch.tensor(hdg, device=self.device)        # [M]
         self._road_speed = torch.tensor(lim, device=self.device)      # [M] m/s
+
+    def _build_rule_lookup(self):
+        """Dense, per-participant lane-point table backing the speed-limit and wrong-way
+        rules.
+
+        The observation cloud above is subsampled to ROAD_POINT_CAP, which is fine for
+        perception but not for a penalty: at 2000 points over 41.7 km of lane the nearest
+        point is 21 m away, and at spawn - agents sitting exactly on a centreline, facing
+        the right way - 28% of them read as wrong-way and 20% pick up another lanelet's
+        speed limit. A penalty that fires on a quarter of correctly driving agents is
+        noise, not a training signal. This table is therefore not subsampled, and it is
+        masked per participant, because pedestrians on a crosswalk otherwise match the
+        road lanelet crossing underneath them (their false wrong-way rate is 0.28 against
+        all lanelets, 0.01 against walkways and crosswalks).
+        """
+        xy, hdg, lim, lls = [], [], [], []
+        for k, ll in enumerate(self.lanelet_map.laneletLayer):
+            v = float(ll.attributes['speed_limit']) / 3.6 if 'speed_limit' in ll.attributes \
+                else self.DEFAULT_SPEED_LIMIT
+            pts = [(p.x, p.y) for p in ll.centerline]
+            for a, b in zip(pts[:-1], pts[1:]):
+                xy.append(a)
+                hdg.append(np.arctan2(b[1] - a[1], b[0] - a[0]))
+                lim.append(v)
+                lls.append(ll)
+        self._rule_xy = torch.tensor(np.asarray(xy, dtype=np.float32), device=self.device)
+        self._rule_dir = torch.tensor(np.asarray(hdg, dtype=np.float32), device=self.device)
+        self._rule_speed = torch.tensor(np.asarray(lim, dtype=np.float32), device=self.device)
+        self._rule_allowed = self._rule_participant_mask(lls)
+
+    def _rule_participant_mask(self, lanelets):
+        """[NUM_TYPES, M] mask of which lane points each agent type may be matched to.
+        The base env has a single vehicle type, so everything is allowed."""
+        return torch.ones(self.NUM_TYPES, len(lanelets), dtype=torch.bool, device=self.device)
+
+    def _agent_types(self):
+        """Per-agent index into the first dimension of `_rule_allowed`."""
+        return torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
 
     # -------------------------------------------------------- traffic lights
     def _build_traffic_lights(self):
@@ -297,16 +337,19 @@ class AWSIMDrivingEnv:
             redlight = (crossed & (self._light_state()[pidx] == 0)).float()
         self._prev_sl_idx, self._prev_sl_signed = idx, signed
 
-        near = self._nearest_road(state)
+        near = self._nearest_rule_point(state)
         # heading against the lane direction by more than 90 degrees
-        wrongway = (torch.cos(psi - self._road_dir[near]) < 0).float()
-        limit = self._road_speed[near]
+        wrongway = (torch.cos(psi - self._rule_dir[near]) < 0).float()
+        limit = self._rule_speed[near]
         speeding = (state[:, 3].abs() - limit).clamp(min=0) / limit
         return redlight, wrongway, speeding
 
-    def _nearest_road(self, state):
-        """Index of the nearest lane-centreline point for each agent."""
-        return torch.cdist(state[:, :2], self._road_xy).argmin(dim=1)
+    def _nearest_rule_point(self, state):
+        """Nearest lane point for each agent, restricted to the ones its participant
+        type may legally be on."""
+        d = torch.cdist(state[:, :2], self._rule_xy)
+        d = d.masked_fill(~self._rule_allowed[self._agent_types()], float('inf'))
+        return d.argmin(dim=1)
 
     # ------------------------------------------------------------- offroad
     # `Simulator.compute_offroad` (without pytorch3d) expands the *whole* driving
@@ -480,7 +523,7 @@ class AWSIMDrivingEnv:
 
     def _ego_features(self, state, prev_action):
         x, y, psi, v = state[:, 0], state[:, 1], state[:, 2], state[:, 3]
-        limit = self._road_speed[self._nearest_road(state)]
+        limit = self._rule_speed[self._nearest_rule_point(state)]
         dx, dy = self.goals[:, 0] - x, self.goals[:, 1] - y
         c, s = torch.cos(psi), torch.sin(psi)
         gx_e = c * dx + s * dy            # goal in ego frame
