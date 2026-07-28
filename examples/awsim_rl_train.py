@@ -79,6 +79,12 @@ class PPOConfig:
     w_wrongway: float = 0.2
     w_speeding: float = 0.6
     w_yield: float = 0.5
+    # Rule penalties ramp in over the first `penalty_warmup` updates, from
+    # `penalty_warmup_start` of their value to full. Applied from the start they punish
+    # driving before the policy can drive, and standing still - a safe zero - wins:
+    # vehicles converged to 3 km/h and zero goals with every rule metric looking ideal.
+    penalty_warmup: int = 200
+    penalty_warmup_start: float = 0.1
 
 
 class ActorCritic(nn.Module):
@@ -218,6 +224,11 @@ def train(cfg: PPOConfig):
         b_done = torch.zeros(cfg.rollout_steps, A, device=dev)
         b_active = torch.zeros(cfg.rollout_steps, A, device=dev)
         completed_returns = []
+        if cfg.penalty_warmup > 0:
+            f = min(1.0, cfg.penalty_warmup_start + (1 - cfg.penalty_warmup_start)
+                    * update / cfg.penalty_warmup)
+            for k in ('offroad', 'collision', 'redlight', 'wrongway', 'speeding', 'yield'):
+                setattr(env, f'w_{k}', getattr(cfg, f'w_{k}') * f)
         # `info` is a snapshot of the step it came from: `reached` accumulates over an
         # episode and resets with it, so reading it off the last rollout step samples a
         # different point of the episode every update (rollout_steps % max_steps steps
@@ -225,6 +236,7 @@ def train(cfg: PPOConfig):
         # Goal-reaching is therefore collected at episode boundaries, and the per-step
         # infraction rates are averaged over the whole rollout.
         ep_reached, ep_reached_type, ep_goals, ep_lost = [], {}, [], []
+        step_speed = []
         step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': []}
 
         for t in range(cfg.rollout_steps):
@@ -238,6 +250,7 @@ def train(cfg: PPOConfig):
             obs = next_obs
             step_coll.append(info['collision'])
             step_off.append(info['offroad'])
+            step_speed.append(info['speed_ratio'])
             for k in step_rule:
                 step_rule[k].append(info[k])
             if bool(done.all()):  # episode boundary -> log and reset
@@ -293,20 +306,21 @@ def train(cfg: PPOConfig):
         mean_reached = float(np.mean(ep_reached)) if ep_reached else info['reached']
         mean_goals = float(np.mean(ep_goals)) if ep_goals else info['goals']
         mean_lost = float(np.mean(ep_lost)) if ep_lost else info['lost']
+        mean_speed = float(np.mean(step_speed))
         mean_coll, mean_off = float(np.mean(step_coll)), float(np.mean(step_off))
         mean_rule = {k: float(np.mean(v)) for k, v in step_rule.items()}
         reached_type = {k: float(np.mean(v)) for k, v in ep_reached_type.items()} or \
                        {k: v for k, v in info.items() if k.startswith('reached_')}
         print(f"upd {update+1:4d}/{cfg.updates} | return {mean_ret:8.3f} | "
               f"goals {mean_goals:5.2f} reached {mean_reached:.2f} coll {mean_coll:.2f} "
-              f"off {mean_off:.2f} lost {mean_lost:4.0f} red {mean_rule['redlight']:.2f} "
+              f"v/lim {mean_speed:.2f} off {mean_off:.2f} lost {mean_lost:4.0f} red {mean_rule['redlight']:.2f} "
               f"wrong {mean_rule['wrongway']:.2f} spd {mean_rule['speeding']:.2f}"
               f"/{mean_rule['speed_excess']:.2f} yld {mean_rule['failtoyield']:.3f} | "
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
             torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))
         if run is not None:
-            metrics = {"return": mean_ret, "reached": mean_reached, "goals": mean_goals, "lost": mean_lost,
+            metrics = {"return": mean_ret, "reached": mean_reached, "goals": mean_goals, "lost": mean_lost, "speed_ratio": mean_speed,
                        "collision": mean_coll, "offroad": mean_off,
                        "loss/policy": last_stats[0], "loss/value": last_stats[1],
                        "entropy": last_stats[2],

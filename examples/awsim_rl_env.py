@@ -877,6 +877,11 @@ class AWSIMDrivingEnv:
             'reached': float(self._reached.float().mean()),
             'goals': float(self._goals_reached.mean()),   # goals collected per agent
             'lost': float(self._lost_count),              # agents recovered from off-road
+            # mean speed against the limit. Without this in the log a policy that has
+            # simply stopped reads as perfect on every rule metric - which is exactly
+            # what happened once the penalties were raised from the start of training.
+            'speed_ratio': float((state[:, 3].abs() / self._rule_speed[
+                self._nearest_rule_point(state)]).clamp(max=3).mean()),
             'redlight': float(redlight.sum()),            # crossings on red this step
             'wrongway': float(wrongway[active].mean()) if bool(active.any()) else 0.0,
             # violation = beyond the tolerated margin; excess is reported in km/h
