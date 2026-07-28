@@ -73,7 +73,7 @@ class PPOConfig:
     w_progress: float = 1.0
     w_goal: float = 1.0
     w_offroad: float = 0.5
-    w_collision: float = 0.5
+    w_collision: float = 0.6
     # traffic-rule penalties (all three are also present in the observation)
     w_redlight: float = 0.5
     w_wrongway: float = 0.2

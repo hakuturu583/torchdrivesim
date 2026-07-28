@@ -66,7 +66,12 @@ class AWSIMDrivingEnv:
     W_PROGRESS = 1.0
     W_GOAL = 1.0
     W_OFFROAD = 0.5
-    W_COLLISION = 0.5
+    # Collision has to outweigh the progress given up by avoiding one. Slowing from v to
+    # a stop costs w_progress * v * dt per step - 0.14 at 14 m/s with w_progress=0.1 -
+    # while the collision itself only costs W_COLLISION per step, so at 0.1 driving
+    # through was strictly cheaper than yielding and the collision rate never moved
+    # across four runs. Same shape as the speeding weight; see W_SPEEDING.
+    W_COLLISION = 0.6
 
     # Rolling goals: instead of parking an agent at its single goal, the next goal is
     # placed GOAL_DIST further along the same route, and the route is extended through
