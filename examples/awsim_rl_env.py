@@ -90,13 +90,20 @@ class AWSIMDrivingEnv:
     INTERSECTION_RADIUS = 40.0       # metres; stop lines within this share a junction
     W_REDLIGHT = 0.5                 # penalty for crossing a stop line on red
     W_WRONGWAY = 0.2                 # penalty per step against the lane direction
-    # Speeding: the penalty is w * (v - limit) / limit and the progress it buys is
-    # w_progress * (v - limit) * dt, so compliance beats speeding by
-    #     w_speeding / (w_progress * dt * limit)
-    # - independent of how far over the agent is, and *weakest on fast roads*. At the
-    # map's most common 50 km/h that ratio is only 1.4 with w=0.2, which PPO reads as a
-    # near-tie; 0.6 makes it ~4.3.
-    W_SPEEDING = 0.6
+    # Speeding: no penalty at all up to SPEED_TOLERANCE over the limit, then growing
+    # exponentially with an e-folding of SPEED_SCALE. A few km/h over is tolerated in
+    # practice and a lot is not, and a linear or quadratic term cannot express both.
+    #
+    #   penalty = min(W_SPEEDING * (exp(over / SPEED_SCALE) - 1), SPEED_PENALTY_CAP)
+    #   over    = max(0, v - limit - SPEED_TOLERANCE)
+    #
+    # The cap matters: many lanelets here are limited to 10 km/h and a vehicle's vmax is
+    # 50, so an uncapped exponential reaches ~20 per step at that excess and would swamp
+    # every other term in the value function.
+    W_SPEEDING = 0.05
+    SPEED_TOLERANCE = 10 / 3.6       # m/s over the limit that costs nothing
+    SPEED_SCALE = 5 / 3.6            # m/s of excess per e-fold beyond the tolerance
+    SPEED_PENALTY_CAP = 2.0          # per step, against collision 0.6 and red light 0.5
     # Failure to yield: the map's right_of_way elements say which lanelets must give way
     # to which. Note what is NOT used here - the other agent's intention. A real vehicle
     # knows the map and can localise its neighbours, so "that agent is on a lanelet with
@@ -460,7 +467,10 @@ class AWSIMDrivingEnv:
         # heading against the lane direction by more than 90 degrees
         wrongway = (torch.cos(psi - self._rule_dir[near]) < 0).float()
         limit = self._rule_speed[near]
-        speeding = (state[:, 3].abs() - limit).clamp(min=0) / limit
+        excess = (state[:, 3].abs() - limit).clamp(min=0)             # m/s over the limit
+        over = (excess - self.SPEED_TOLERANCE).clamp(min=0)
+        speeding = ((over / self.SPEED_SCALE).exp() - 1).clamp(max=self.SPEED_PENALTY_CAP
+                                                              / max(self.w_speeding, 1e-9))
 
         # failure to yield: rolling through a give-way lanelet while an agent with
         # priority is close by. A proxy, not a conflict-point calculation - it says
@@ -472,6 +482,7 @@ class AWSIMDrivingEnv:
         threatened = (close & prio).any(dim=1)
         failtoyield = (self._yield_lanelet[lane] & threatened
                        & (state[:, 3].abs() > self.YIELD_SPEED)).float()
+        self._excess_kmh = excess * 3.6
         return redlight, wrongway, speeding, failtoyield
 
     def _nearest_rule_point(self, state):
@@ -799,7 +810,8 @@ class AWSIMDrivingEnv:
         reward = (self.w_progress * progress - self.w_collision * collision
                   - self.w_offroad * offroad + self.w_goal * newly_reached.float()
                   - self.w_redlight * redlight - self.w_wrongway * wrongway
-                  - self.w_speeding * speeding - self.w_yield * failtoyield)
+                  - self.w_speeding * speeding            # see W_SPEEDING
+                  - self.w_yield * failtoyield)
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
         self._goals_reached += newly_reached.float()
@@ -831,9 +843,10 @@ class AWSIMDrivingEnv:
             'goals': float(self._goals_reached.mean()),   # goals collected per agent
             'redlight': float(redlight.sum()),            # crossings on red this step
             'wrongway': float(wrongway[active].mean()) if bool(active.any()) else 0.0,
-            'speeding': float((speeding[active] > self.SPEEDING_TOLERANCE).float().mean())
+            # violation = beyond the tolerated margin; excess is reported in km/h
+            'speeding': float((self._excess_kmh[active] > self.SPEED_TOLERANCE * 3.6).float().mean())
                         if bool(active.any()) else 0.0,
-            'speed_excess': float(speeding[active].mean()) if bool(active.any()) else 0.0,
+            'speed_excess': float(self._excess_kmh[active].mean()) if bool(active.any()) else 0.0,
             'failtoyield': float(failtoyield[active].mean()) if bool(active.any()) else 0.0,
             'collision': float(collision[active].mean()) if bool(active.any()) else 0.0,
             'offroad': float(offroad[active].mean()) if bool(active.any()) else 0.0,
