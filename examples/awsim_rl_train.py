@@ -72,7 +72,7 @@ class PPOConfig:
     goal_dist: float = -1.0    # base env only, metres; <0 keeps the env default
     w_progress: float = 1.0
     w_goal: float = 1.0
-    w_offroad: float = 0.5
+    w_offroad: float = 0.6
     w_collision: float = 0.6
     # traffic-rule penalties (all three are also present in the observation)
     w_redlight: float = 0.5
@@ -224,7 +224,7 @@ def train(cfg: PPOConfig):
         # further in each time) and swings wildly for no reason related to learning.
         # Goal-reaching is therefore collected at episode boundaries, and the per-step
         # infraction rates are averaged over the whole rollout.
-        ep_reached, ep_reached_type, ep_goals = [], {}, []
+        ep_reached, ep_reached_type, ep_goals, ep_lost = [], {}, [], []
         step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': []}
 
         for t in range(cfg.rollout_steps):
@@ -244,6 +244,7 @@ def train(cfg: PPOConfig):
                 completed_returns.append(float(ep_return.mean()))
                 ep_reached.append(info['reached'])
                 ep_goals.append(info['goals'])
+                ep_lost.append(info['lost'])
                 for k, v in info.items():
                     if k.startswith('reached_') or k.startswith('goals_'):
                         ep_reached_type.setdefault(k, []).append(v)
@@ -291,20 +292,21 @@ def train(cfg: PPOConfig):
         # falls back to the last snapshot only when the rollout spans no full episode
         mean_reached = float(np.mean(ep_reached)) if ep_reached else info['reached']
         mean_goals = float(np.mean(ep_goals)) if ep_goals else info['goals']
+        mean_lost = float(np.mean(ep_lost)) if ep_lost else info['lost']
         mean_coll, mean_off = float(np.mean(step_coll)), float(np.mean(step_off))
         mean_rule = {k: float(np.mean(v)) for k, v in step_rule.items()}
         reached_type = {k: float(np.mean(v)) for k, v in ep_reached_type.items()} or \
                        {k: v for k, v in info.items() if k.startswith('reached_')}
         print(f"upd {update+1:4d}/{cfg.updates} | return {mean_ret:8.3f} | "
               f"goals {mean_goals:5.2f} reached {mean_reached:.2f} coll {mean_coll:.2f} "
-              f"off {mean_off:.2f} red {mean_rule['redlight']:.2f} "
+              f"off {mean_off:.2f} lost {mean_lost:4.0f} red {mean_rule['redlight']:.2f} "
               f"wrong {mean_rule['wrongway']:.2f} spd {mean_rule['speeding']:.2f}"
               f"/{mean_rule['speed_excess']:.2f} yld {mean_rule['failtoyield']:.3f} | "
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
             torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))
         if run is not None:
-            metrics = {"return": mean_ret, "reached": mean_reached, "goals": mean_goals,
+            metrics = {"return": mean_ret, "reached": mean_reached, "goals": mean_goals, "lost": mean_lost,
                        "collision": mean_coll, "offroad": mean_off,
                        "loss/policy": last_stats[0], "loss/value": last_stats[1],
                        "entropy": last_stats[2],

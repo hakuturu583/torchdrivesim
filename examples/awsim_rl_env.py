@@ -65,7 +65,18 @@ class AWSIMDrivingEnv:
     # the return scale, and with vf_coef=2.0 the value loss then dominates the gradient.
     W_PROGRESS = 1.0
     W_GOAL = 1.0
-    W_OFFROAD = 0.5
+    # Leaving the road has to cost more than the shortcut it buys: driving straight at
+    # the goal through a building earns w_progress * v * dt = 0.14 per step at 14 m/s,
+    # against which an 0.1 penalty was a net profit of 0.04 - and the policy took it.
+    # Measured at w_offroad=0.1, excursions ran to 214 steps (21 s, a whole episode) and
+    # runs of 3 s or longer accounted for 71% of all off-road time.
+    W_OFFROAD = 0.6
+    # Progress is not credited while off the drivable surface, so cutting a corner earns
+    # nothing rather than merely costing a little.
+    # An agent that has been off-road this long is not clipping a kerb, it is lost, and
+    # is put back on a fresh route rather than left to drive through buildings for the
+    # rest of the episode (the median excursion is 9 steps, the 90th percentile 55).
+    OFFROAD_PATIENCE = 20
     # Collision has to outweigh the progress given up by avoiding one. Slowing from v to
     # a stop costs w_progress * v * dt per step - 0.14 at 14 m/s with w_progress=0.1 -
     # while the collision itself only costs W_COLLISION per step, so at 0.1 driving
@@ -631,6 +642,29 @@ class AWSIMDrivingEnv:
         (x, y, heading), or None if the env cannot respawn (base env)."""
         return None
 
+    def _recover(self, mask):
+        """Put agents that have driven off the road and stayed off back on a route."""
+        moved = []
+        for i in mask.nonzero(as_tuple=True)[0].tolist():
+            pose = self._respawn(i)
+            if pose is not None:
+                moved.append((i, pose))
+        self._lost_count = getattr(self, '_lost_count', 0) + len(moved)
+        return self._teleport(moved)
+
+    def _teleport(self, moved):
+        """Move the listed agents to (x, y, heading) at rest. Returns whether any moved."""
+        if not moved:
+            return False
+        state = self._state().clone()
+        m = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
+        for i, (x, y, h) in moved:
+            state[i, 0], state[i, 1], state[i, 2], state[i, 3] = x, y, h, 0.0
+            m[i] = True
+            self._prev_sl_idx[i] = -1
+        self.simulator.set_state(state.unsqueeze(0), mask=m.unsqueeze(0))
+        return True
+
     def _advance_goals(self, mask):
         """Place the next goal further along the route for every agent in `mask`.
 
@@ -657,15 +691,7 @@ class AWSIMDrivingEnv:
                     s = min(self._goal_dist[i], total)
             self._s_goal[i] = min(s, total)
         self._sync_goals(idx)
-        if moved:
-            state = self._state().clone()
-            m = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
-            for i, (x, y, h) in moved:
-                state[i, 0], state[i, 1], state[i, 2], state[i, 3] = x, y, h, 0.0
-                m[i] = True
-                self._prev_sl_idx[i] = -1
-            self.simulator.set_state(state.unsqueeze(0), mask=m.unsqueeze(0))
-        return bool(moved)
+        return self._teleport(moved)
 
     def _observation(self, state, prev_action):
         # [A, EGO_DIM | MAX_PARTNERS*PARTNER_FEATURES | MAX_ROAD*ROAD_FEATURES];
@@ -783,6 +809,8 @@ class AWSIMDrivingEnv:
         self._reached = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._goals_reached = torch.zeros(self.num_agents, device=self.device)
         self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
+        self._off_run = torch.zeros(self.num_agents, device=self.device)
+        self._lost_count = 0
         self._prev_sl_idx = torch.full((self.num_agents,), -1, dtype=torch.long, device=self.device)
         self._prev_sl_signed = torch.zeros(self.num_agents, device=self.device)
         state = self._state()
@@ -803,6 +831,7 @@ class AWSIMDrivingEnv:
         progress = (self._prev_dist - dist)                                   # dense shaping
         collision = (self._collision(state) > 0).float()
         offroad = (self._offroad(state) > 0).float()
+        progress = progress * (1.0 - offroad)      # no credit for shortcutting off-road
         redlight, wrongway, speeding, failtoyield = self._rule_violations(state)
         newly_reached = (dist < self.goal_radius) & (~was_reached)
         reward = (self.w_progress * progress - self.w_collision * collision
@@ -812,6 +841,14 @@ class AWSIMDrivingEnv:
                   - self.w_yield * failtoyield)
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
+        # a sustained excursion means the agent is lost, not clipping a kerb
+        self._off_run = (self._off_run + offroad) * offroad
+        lost = self._off_run >= self.OFFROAD_PATIENCE
+        if self.rolling_goals and bool(lost.any()):
+            if self._recover(lost):
+                state = self._state()
+                dist = self._dist_to_goal(state)
+            self._off_run = self._off_run * (~lost).float()
         self._goals_reached += newly_reached.float()
         if self.rolling_goals:
             # Hand out the next goal instead of parking the agent. Only an agent whose
@@ -839,6 +876,7 @@ class AWSIMDrivingEnv:
         info = {
             'reached': float(self._reached.float().mean()),
             'goals': float(self._goals_reached.mean()),   # goals collected per agent
+            'lost': float(self._lost_count),              # agents recovered from off-road
             'redlight': float(redlight.sum()),            # crossings on red this step
             'wrongway': float(wrongway[active].mean()) if bool(active.any()) else 0.0,
             # violation = beyond the tolerated margin; excess is reported in km/h
