@@ -213,7 +213,7 @@ def train(cfg: PPOConfig):
 
     obs = env.reset()
     ep_return = torch.zeros(A, device=dev)
-    history = []
+    history, sweep_hist = [], []
 
     for update in range(cfg.updates):
         b_obs = torch.zeros(cfg.rollout_steps, A, od, device=dev)
@@ -309,6 +309,7 @@ def train(cfg: PPOConfig):
         mean_speed = float(np.mean(step_speed))
         mean_coll, mean_off = float(np.mean(step_coll)), float(np.mean(step_off))
         mean_rule = {k: float(np.mean(v)) for k, v in step_rule.items()}
+        sweep_hist.append((mean_goals, mean_coll, mean_rule['failtoyield'], mean_speed))
         reached_type = {k: float(np.mean(v)) for k, v in ep_reached_type.items()} or \
                        {k: v for k, v in info.items() if k.startswith('reached_')}
         print(f"upd {update+1:4d}/{cfg.updates} | return {mean_ret:8.3f} | "
@@ -341,6 +342,19 @@ def train(cfg: PPOConfig):
         plt.savefig(os.path.join(cfg.save_dir, "reward_curve.png"))
     except Exception as exc:
         print(f"[plot] skipped: {exc}")
+
+    # Sweep objective. Collision and yield rates alone are maximised by standing still -
+    # that failure has already happened once here - so the score has to carry task
+    # performance too. `goals` does that: when the wheeled agents parked it fell to 2.68
+    # (pedestrians only) against 3.89 for a policy that drives.
+    tail = sweep_hist[-20:] or [(0.0, 0.0, 0.0, 0.0)]
+    g, c, y, v = (float(np.mean([t[i] for t in tail])) for i in range(4))
+    score = g - 10.0 * c - 10.0 * y
+    print(f"[sweep] score {score:.3f} = goals {g:.3f} - 10*coll {c:.4f} - 10*yield {y:.4f}"
+          f"  (v/lim {v:.2f}, mean of last {len(tail)} updates)", flush=True)
+    if run is not None:
+        run.summary.update({"sweep/score": score, "sweep/goals": g, "sweep/collision": c,
+                            "sweep/failtoyield": y, "sweep/speed_ratio": v})
 
     torch.save(net.state_dict(), os.path.join(cfg.save_dir, "policy.pt"))
 

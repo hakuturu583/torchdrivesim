@@ -1,0 +1,54 @@
+# Weight search for the two rule penalties that would not move: collision sat at
+# 0.07-0.09 and failure-to-yield at 0.059 across a full 900-update run.
+#
+#   wandb sweep examples/sweep_collision_yield.yaml
+#   env -u WANDB_API_KEY wandb agent <entity>/<project>/<sweep_id>
+#
+# Runs are sequential: measured on this box, four concurrent runs each go 4x slower and
+# aggregate throughput is unchanged (10.5 s/update alone, 42.8 s/update at four), so one
+# run already saturates the GPU. VRAM is not the limit - 1.5 GB of 24 - the SMs are.
+# One trial is ~35 minutes at 200 updates.
+#
+# The objective carries `goals` on purpose. Minimising collision and yield rates on
+# their own is maximised by not moving, and that degenerate solution has already
+# occurred here once - every rule metric looked ideal while the cars were parked.
+program: examples/awsim_rl_train.py
+method: bayes
+metric:
+  name: sweep/score
+  goal: maximize
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}          # OmegaConf dot-list: key=value, not --key value
+parameters:
+  w_collision:
+    distribution: log_uniform_values
+    min: 0.1
+    max: 2.0
+  w_yield:
+    distribution: log_uniform_values
+    min: 0.1
+    max: 3.0
+  # fixed - these are the settings the two weights are being tuned against
+  hetero: {value: true}
+  map_path: {value: nishishinjuku_autoware_map/lanelet2_map.osm}
+  device: {value: cuda}
+  num_agents: {value: 512}
+  updates: {value: 200}
+  rollout_steps: {value: 256}
+  max_steps: {value: 250}
+  lr: {value: 5e-4}
+  ent_coef: {value: 0.002}
+  vf_coef: {value: 0.5}
+  penalty_warmup: {value: 150}
+  w_progress: {value: 0.1}
+  w_goal: {value: 5.0}
+  w_offroad: {value: 0.6}
+  w_redlight: {value: 0.5}
+  w_wrongway: {value: 0.2}
+  w_speeding: {value: 0.05}
+  wandb: {value: true}
+  wandb_project: {value: awsim-rl}
+  save_dir: {value: ./awsim_rl_output/sweep}
