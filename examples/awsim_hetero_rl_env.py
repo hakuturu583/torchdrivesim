@@ -73,7 +73,8 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  spawn_attempts=25, spawn_gap=1.5, pool_cap=120,
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
                  rolling_goals=None, goal_dist=None,
-                 w_redlight=None, w_wrongway=None, w_speeding=None):
+                 w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None):
+        self.w_yield = self.W_YIELD if w_yield is None else w_yield
         self.w_redlight = self.W_REDLIGHT if w_redlight is None else w_redlight
         self.w_wrongway = self.W_WRONGWAY if w_wrongway is None else w_wrongway
         self.w_speeding = self.W_SPEEDING if w_speeding is None else w_speeding

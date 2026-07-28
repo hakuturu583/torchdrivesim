@@ -78,6 +78,7 @@ class PPOConfig:
     w_redlight: float = 0.5
     w_wrongway: float = 0.2
     w_speeding: float = 0.6
+    w_yield: float = 0.5
 
 
 class ActorCritic(nn.Module):
@@ -188,7 +189,7 @@ def train(cfg: PPOConfig):
                   w_progress=cfg.w_progress, w_goal=cfg.w_goal,
                   w_offroad=cfg.w_offroad, w_collision=cfg.w_collision,
                   w_redlight=cfg.w_redlight, w_wrongway=cfg.w_wrongway,
-                  w_speeding=cfg.w_speeding)
+                  w_speeding=cfg.w_speeding, w_yield=cfg.w_yield)
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
                       env.MAX_ROAD, env.ROAD_FEATURES, ad, cfg.hidden,
@@ -224,7 +225,7 @@ def train(cfg: PPOConfig):
         # Goal-reaching is therefore collected at episode boundaries, and the per-step
         # infraction rates are averaged over the whole rollout.
         ep_reached, ep_reached_type, ep_goals = [], {}, []
-        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': []}
+        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': []}
 
         for t in range(cfg.rollout_steps):
             with torch.no_grad():
@@ -298,7 +299,7 @@ def train(cfg: PPOConfig):
               f"goals {mean_goals:5.2f} reached {mean_reached:.2f} coll {mean_coll:.2f} "
               f"off {mean_off:.2f} red {mean_rule['redlight']:.2f} "
               f"wrong {mean_rule['wrongway']:.2f} spd {mean_rule['speeding']:.2f}"
-              f"/{mean_rule['speed_excess']:.2f} | "
+              f"/{mean_rule['speed_excess']:.2f} yld {mean_rule['failtoyield']:.3f} | "
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
             torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))

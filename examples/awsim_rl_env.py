@@ -44,9 +44,9 @@ class AWSIMDrivingEnv:
     """
 
     ACT_DIM = 2
-    EGO_DIM = 14              # speed, goal, prev action, signal (5), speed limit
+    EGO_DIM = 15              # speed, goal, prev action, signal (5), limit, must-yield
     MAX_PARTNERS = 8          # K nearest neighbours observed
-    PARTNER_FEATURES = 7      # rel_x, rel_y, width, length, rel_head_cos/sin, rel_speed
+    PARTNER_FEATURES = 8      # rel_x/y, width, length, rel_head_cos/sin, rel_speed, has_priority
     VIEW_RADIUS = 30.0        # metres; neighbours beyond this are not observed
     MAX_ROAD = 10             # K nearest road-graph points observed
     ROAD_FEATURES = 4         # rel_x, rel_y, rel_dir_cos, rel_dir_sin
@@ -92,6 +92,14 @@ class AWSIMDrivingEnv:
     # map's most common 50 km/h that ratio is only 1.4 with w=0.2, which PPO reads as a
     # near-tie; 0.6 makes it ~4.3.
     W_SPEEDING = 0.6
+    # Failure to yield: the map's right_of_way elements say which lanelets must give way
+    # to which. Note what is NOT used here - the other agent's intention. A real vehicle
+    # knows the map and can localise its neighbours, so "that agent is on a lanelet with
+    # priority over mine" is fair game; "that agent is about to go" is not, and a policy
+    # trained on it would not transfer off the simulator.
+    W_YIELD = 0.5
+    YIELD_RADIUS = 25.0              # metres; a priority agent nearer than this must be given way
+    YIELD_SPEED = 1.0                # m/s; below this the agent counts as having stopped
     # vehicle vmax (14.0 m/s) sits a hair above the 50 km/h limit (13.89), so counting
     # any excess at all reports a full-speed car on a main road as a violation. Only
     # count a real margin, and report the magnitude separately.
@@ -101,7 +109,8 @@ class AWSIMDrivingEnv:
                  goal_radius=3.0, render_fov=None, render_res=512, seed=0,
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
                  rolling_goals=None, goal_dist=None,
-                 w_redlight=None, w_wrongway=None, w_speeding=None):
+                 w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None):
+        self.w_yield = self.W_YIELD if w_yield is None else w_yield
         self.w_redlight = self.W_REDLIGHT if w_redlight is None else w_redlight
         self.w_wrongway = self.W_WRONGWAY if w_wrongway is None else w_wrongway
         self.w_speeding = self.W_SPEEDING if w_speeding is None else w_speeding
@@ -213,6 +222,50 @@ class AWSIMDrivingEnv:
         self._rule_dir = torch.tensor(np.asarray(hdg, dtype=np.float32), device=self.device)
         self._rule_speed = torch.tensor(np.asarray(lim, dtype=np.float32), device=self.device)
         self._rule_allowed = self._rule_participant_mask(lls)
+        self._build_right_of_way(lls)
+
+    def _build_right_of_way(self, lanelets):
+        """Which lanelet must give way to which, from the map's right_of_way elements.
+
+        `_priority[i, j]` is True when lanelet j has right of way over lanelet i. The
+        matrix is dense (L x L bools, ~1 MB at 979 lanelets) so the per-step lookup is a
+        single gather.
+        """
+        ids = sorted({ll.id for ll in lanelets})
+        order = {i: k for k, i in enumerate(ids)}
+        L = len(ids)
+        priority = torch.zeros(L, L, dtype=torch.bool, device=self.device)
+        yields = torch.zeros(L, dtype=torch.bool, device=self.device)
+        seen, parsed = set(), 0
+        for ll in self.lanelet_map.laneletLayer:
+            for r in ll.regulatoryElements:
+                if 'subtype' not in r.attributes or r.attributes['subtype'] != 'right_of_way':
+                    continue
+                if r.id in seen:
+                    continue
+                seen.add(r.id)
+                # these are methods, not properties - reading them as attributes
+                # yields a bound method and silently produces empty tables
+                prio = [x.id for x in r.rightOfWayLanelets()]
+                give = [x.id for x in r.yieldLanelets()]
+                parsed += 1
+                for y in give:
+                    if y not in order:
+                        continue
+                    yields[order[y]] = True
+                    for pz in prio:
+                        if pz in order:
+                            priority[order[y], order[pz]] = True
+        if seen and not parsed:
+            raise RuntimeError('right_of_way elements found but none parsed')
+        self._lanelet_order = order
+        self._priority = priority
+        self._yield_lanelet = yields
+        self._pt_lanelet = torch.tensor([order[ll.id] for ll in lanelets], device=self.device)
+
+    def _agent_lanelet(self, state):
+        """Index (into the right-of-way tables) of the lanelet each agent is on."""
+        return self._pt_lanelet[self._nearest_rule_point(state)]
 
     def _rule_participant_mask(self, lanelets):
         """[NUM_TYPES, M] mask of which lane points each agent type may be matched to.
@@ -335,7 +388,7 @@ class AWSIMDrivingEnv:
         A = state.shape[0]
         psi = state[:, 2]
         fwd = torch.stack([torch.cos(psi), torch.sin(psi)], dim=-1)
-        idx, signed, _ = self._signals(state)
+        idx, signed, _ = self._signals_cached(state)
 
         redlight = torch.zeros(A, device=self.device)
         if self._sl_xy.shape[0] > 0:
@@ -352,14 +405,39 @@ class AWSIMDrivingEnv:
         wrongway = (torch.cos(psi - self._rule_dir[near]) < 0).float()
         limit = self._rule_speed[near]
         speeding = (state[:, 3].abs() - limit).clamp(min=0) / limit
-        return redlight, wrongway, speeding
+
+        # failure to yield: rolling through a give-way lanelet while an agent with
+        # priority is close by. A proxy, not a conflict-point calculation - it says
+        # "you should have waited", not "you would have hit them".
+        lane = self._pt_lanelet[near]
+        close = torch.cdist(state[:, :2], state[:, :2]) < self.YIELD_RADIUS
+        close.fill_diagonal_(False)
+        prio = self._priority[lane][:, lane]                     # [A, A] j has priority over i
+        threatened = (close & prio).any(dim=1)
+        failtoyield = (self._yield_lanelet[lane] & threatened
+                       & (state[:, 3].abs() > self.YIELD_SPEED)).float()
+        return redlight, wrongway, speeding, failtoyield
 
     def _nearest_rule_point(self, state):
         """Nearest lane point for each agent, restricted to the ones its participant
-        type may legally be on."""
-        d = torch.cdist(state[:, :2], self._rule_xy)
-        d = d.masked_fill(~self._rule_allowed[self._agent_types()], float('inf'))
-        return d.argmin(dim=1)
+        type may legally be on.
+
+        The observation and the rule check both need this, and it is a cdist against
+        ~28k points, so the result is cached for the state tensor it was computed from
+        (three calls per step is what took the step from 30 to 60 ms).
+        """
+        key = state.data_ptr(), state._version
+        if getattr(self, '_near_key', None) != key:
+            d = torch.cdist(state[:, :2], self._rule_xy)
+            d = d.masked_fill(~self._rule_allowed[self._agent_types()], float('inf'))
+            self._near_key, self._near_val = key, d.argmin(dim=1)
+        return self._near_val
+
+    def _signals_cached(self, state):
+        key = state.data_ptr(), state._version
+        if getattr(self, '_sig_key', None) != key:
+            self._sig_key, self._sig_val = key, self._signals(state)
+        return self._sig_val
 
     # ------------------------------------------------------------- offroad
     # `Simulator.compute_offroad` (without pytorch3d) expands the *whole* driving
@@ -533,7 +611,8 @@ class AWSIMDrivingEnv:
 
     def _ego_features(self, state, prev_action):
         x, y, psi, v = state[:, 0], state[:, 1], state[:, 2], state[:, 3]
-        limit = self._rule_speed[self._nearest_rule_point(state)]
+        near = self._nearest_rule_point(state)
+        limit, lane = self._rule_speed[near], self._pt_lanelet[near]
         dx, dy = self.goals[:, 0] - x, self.goals[:, 1] - y
         c, s = torch.cos(psi), torch.sin(psi)
         gx_e = c * dx + s * dy            # goal in ego frame
@@ -547,9 +626,10 @@ class AWSIMDrivingEnv:
             (gx_e / 50.0).clamp(-2, 2), (gy_e / 50.0).clamp(-2, 2),
             prev_action[:, 0], prev_action[:, 1],
             limit / 10.0,
+            self._yield_lanelet[lane].float(),      # "I have to give way here"
         ], dim=-1)
         # the signal block is what makes the red-light penalty learnable
-        return torch.cat([base, self._signals(state)[2]], dim=-1)
+        return torch.cat([base, self._signals_cached(state)[2]], dim=-1)
 
     def _partner_extra(self, nidx, valid):
         """Optional extra per-neighbour features (e.g. type one-hot). None in base."""
@@ -579,8 +659,13 @@ class AWSIMDrivingEnv:
             wj = self.agent_size[0, :, 1][nidx] / 3.0
             lj = self.agent_size[0, :, 0][nidx] / 6.0
             vj = v[nidx] / 10.0
+            # map-derived priority of each neighbour over the ego's lanelet. This is
+            # position plus HD map, not intention - see W_YIELD.
+            lane = self._agent_lanelet(state)
+            has_prio = self._priority[lane][torch.arange(A, device=self.device)[:, None],
+                                            lane[nidx]].float()
             feat = torch.stack([rel_x, rel_y, wj, lj,
-                                torch.cos(rel_h), torch.sin(rel_h), vj], dim=-1)  # [A, k, 7]
+                                torch.cos(rel_h), torch.sin(rel_h), vj, has_prio], dim=-1)
             extra = self._partner_extra(nidx, valid)
             if extra is not None:
                 feat = torch.cat([feat, extra], dim=-1)
@@ -653,12 +738,12 @@ class AWSIMDrivingEnv:
         progress = (self._prev_dist - dist)                                   # dense shaping
         collision = (self._collision(state) > 0).float()
         offroad = (self._offroad(state) > 0).float()
-        redlight, wrongway, speeding = self._rule_violations(state)
+        redlight, wrongway, speeding, failtoyield = self._rule_violations(state)
         newly_reached = (dist < self.goal_radius) & (~was_reached)
         reward = (self.w_progress * progress - self.w_collision * collision
                   - self.w_offroad * offroad + self.w_goal * newly_reached.float()
                   - self.w_redlight * redlight - self.w_wrongway * wrongway
-                  - self.w_speeding * speeding)
+                  - self.w_speeding * speeding - self.w_yield * failtoyield)
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
         self._goals_reached += newly_reached.float()
@@ -693,6 +778,7 @@ class AWSIMDrivingEnv:
             'speeding': float((speeding[active] > self.SPEEDING_TOLERANCE).float().mean())
                         if bool(active.any()) else 0.0,
             'speed_excess': float(speeding[active].mean()) if bool(active.any()) else 0.0,
+            'failtoyield': float(failtoyield[active].mean()) if bool(active.any()) else 0.0,
             'collision': float(collision[active].mean()) if bool(active.any()) else 0.0,
             'offroad': float(offroad[active].mean()) if bool(active.any()) else 0.0,
             'active': active,
