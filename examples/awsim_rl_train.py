@@ -259,7 +259,7 @@ def train(cfg: PPOConfig):
                 ep_goals.append(info['goals'])
                 ep_lost.append(info['lost'])
                 for k, v in info.items():
-                    if k.startswith('reached_') or k.startswith('goals_'):
+                    if k.startswith(('reached_', 'goals_', 'speed_')):
                         ep_reached_type.setdefault(k, []).append(v)
                 ep_return = torch.zeros(A, device=dev)
                 obs = env.reset()
@@ -325,8 +325,9 @@ def train(cfg: PPOConfig):
                        "loss/policy": last_stats[0], "loss/value": last_stats[1],
                        "entropy": last_stats[2],
                        **{f"rule/{k}": v for k, v in mean_rule.items()}}
-            metrics.update({(f"reached/{k[8:]}" if k.startswith('reached_') else f"goals/{k[6:]}"): v
-                            for k, v in reached_type.items()})
+            for k, v in reached_type.items():
+                pre, name = k.split('_', 1)
+                metrics[f'{pre}/{name}'] = v
             run.log(metrics, step=update)
 
     # save reward curve
@@ -361,6 +362,9 @@ def train(cfg: PPOConfig):
     per_type = {k: v for k, v in info.items() if k.startswith('goals_')}
     if per_type:
         print("[done] per-type goals/agent: " + ", ".join(f"{k[6:]} {v:.2f}" for k, v in per_type.items()))
+    per_speed = {k: v for k, v in info.items() if k.startswith('speed_')}
+    if per_speed:
+        print("[done] per-type v/limit: " + ", ".join(f"{k[6:]} {v:.2f}" for k, v in per_speed.items()))
 
     if run is not None:
         import wandb

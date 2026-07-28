@@ -313,7 +313,12 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             self.simulator.set_state(new_state.unsqueeze(0))
 
     def _augment_info(self, info):
+        sr = self._speed_ratio(self._state())
         for i, t in enumerate(TYPES):  # per-type goal-reaching
             m = (self._type_idx_t == i)
             info[f'reached_{t}'] = float(self._reached[m].float().mean()) if bool(m.any()) else 0.0
             info[f'goals_{t}'] = float(self._goals_reached[m].mean()) if bool(m.any()) else 0.0
+            # per type, because the mixed average hides which types have stopped: when
+            # the wheeled agents parked, the overall ratio was 0.22 while pedestrians
+            # were still at 0.53 of their limit
+            info[f'speed_{t}'] = float(sr[m].mean()) if bool(m.any()) else 0.0

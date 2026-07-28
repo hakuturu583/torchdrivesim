@@ -450,6 +450,14 @@ class AWSIMDrivingEnv:
                           (signed / self.TL_RADIUS).clamp(0, 1).unsqueeze(1), onehot], dim=-1)
         return idx, signed, feat
 
+    def _speed_ratio(self, state):
+        """Per-agent speed as a fraction of the limit where it is. Reported because
+        every rule metric is a violation rate, and a policy that simply stops scores
+        perfectly on all of them - which is what happened once the penalties were
+        applied from the first update."""
+        return (state[:, 3].abs()
+                / self._rule_speed[self._nearest_rule_point(state)]).clamp(max=3)
+
     def _rule_violations(self, state):
         """Red-light crossings, wrong-way driving and speeding, as [A] tensors.
 
@@ -880,8 +888,7 @@ class AWSIMDrivingEnv:
             # mean speed against the limit. Without this in the log a policy that has
             # simply stopped reads as perfect on every rule metric - which is exactly
             # what happened once the penalties were raised from the start of training.
-            'speed_ratio': float((state[:, 3].abs() / self._rule_speed[
-                self._nearest_rule_point(state)]).clamp(max=3).mean()),
+            'speed_ratio': float(self._speed_ratio(state).mean()),
             'redlight': float(redlight.sum()),            # crossings on red this step
             'wrongway': float(wrongway[active].mean()) if bool(active.any()) else 0.0,
             # violation = beyond the tolerated margin; excess is reported in km/h
