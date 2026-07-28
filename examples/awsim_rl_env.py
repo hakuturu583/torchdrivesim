@@ -90,20 +90,19 @@ class AWSIMDrivingEnv:
     INTERSECTION_RADIUS = 40.0       # metres; stop lines within this share a junction
     W_REDLIGHT = 0.5                 # penalty for crossing a stop line on red
     W_WRONGWAY = 0.2                 # penalty per step against the lane direction
-    # Speeding: no penalty at all up to SPEED_TOLERANCE over the limit, then growing
-    # exponentially with an e-folding of SPEED_SCALE. A few km/h over is tolerated in
-    # practice and a lot is not, and a linear or quadratic term cannot express both.
+    # Speeding: free up to SPEED_TOLERANCE over the limit, then quadratic in the excess
+    # beyond it. A few km/h over is tolerated in practice and a lot is not; a plain
+    # linear term cannot say both, and the earlier ratio form was scale-free, which made
+    # a 10 km/h zone proportionally as forgiving as a 50 km/h one - backwards.
     #
-    #   penalty = min(W_SPEEDING * (exp(over / SPEED_SCALE) - 1), SPEED_PENALTY_CAP)
-    #   over    = max(0, v - limit - SPEED_TOLERANCE)
+    #   penalty = min(W_SPEEDING * over^2, SPEED_PENALTY_CAP),  over = max(0, v - limit - tol)
     #
-    # The cap matters: many lanelets here are limited to 10 km/h and a vehicle's vmax is
-    # 50, so an uncapped exponential reaches ~20 per step at that excess and would swamp
-    # every other term in the value function.
+    # The cap is a safety rail rather than a shaping choice: a motorcycle at its 65 km/h
+    # vmax in one of the map's 10 km/h zones is 15 m/s over, and 0.05 * 12.4^2 is 7.7 in
+    # a single step, enough to distort the value function on its own.
     W_SPEEDING = 0.05
     SPEED_TOLERANCE = 10 / 3.6       # m/s over the limit that costs nothing
-    SPEED_SCALE = 5 / 3.6            # m/s of excess per e-fold beyond the tolerance
-    SPEED_PENALTY_CAP = 2.0          # per step, against collision 0.6 and red light 0.5
+    SPEED_PENALTY_CAP = 4.0          # per step; only binds past ~+43 km/h
     # Failure to yield: the map's right_of_way elements say which lanelets must give way
     # to which. Note what is NOT used here - the other agent's intention. A real vehicle
     # knows the map and can localise its neighbours, so "that agent is on a lanelet with
@@ -469,8 +468,7 @@ class AWSIMDrivingEnv:
         limit = self._rule_speed[near]
         excess = (state[:, 3].abs() - limit).clamp(min=0)             # m/s over the limit
         over = (excess - self.SPEED_TOLERANCE).clamp(min=0)
-        speeding = ((over / self.SPEED_SCALE).exp() - 1).clamp(max=self.SPEED_PENALTY_CAP
-                                                              / max(self.w_speeding, 1e-9))
+        speeding = over.pow(2).clamp(max=self.SPEED_PENALTY_CAP / max(self.w_speeding, 1e-9))
 
         # failure to yield: rolling through a give-way lanelet while an agent with
         # priority is close by. A proxy, not a conflict-point calculation - it says
