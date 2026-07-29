@@ -79,6 +79,7 @@ class PPOConfig:
     w_wrongway: float = 0.2
     w_speeding: float = 0.6
     w_yield: float = 0.5
+    n_parked: int = 16         # stationary cars on straight lanelets (hetero env only)
     w_proximity: float = 0.3
     ttc_threshold: float = 3.0
     # Rule penalties ramp in over the first `penalty_warmup` updates, from
@@ -198,7 +199,8 @@ def train(cfg: PPOConfig):
                   w_offroad=cfg.w_offroad, w_collision=cfg.w_collision,
                   w_redlight=cfg.w_redlight, w_wrongway=cfg.w_wrongway,
                   w_speeding=cfg.w_speeding, w_yield=cfg.w_yield,
-                  w_proximity=cfg.w_proximity, ttc_threshold=cfg.ttc_threshold)
+                  w_proximity=cfg.w_proximity, ttc_threshold=cfg.ttc_threshold,
+                  **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
                       env.MAX_ROAD, env.ROAD_FEATURES, ad, cfg.hidden,

@@ -96,7 +96,11 @@ class AWSIMDrivingEnv:
     # accelerates into agents it can see. This penalises closing time instead, so the
     # signal exists before the boxes overlap.
     W_PROXIMITY = 0.3
-    TTC_THRESHOLD = 3.0              # seconds; closing faster than this starts to cost
+    TTC_THRESHOLD = 3.0              # seconds; contact predicted sooner than this costs
+    PROXIMITY_MARGIN = 0.5           # metres of lateral clearance counted as a conflict
+    RSS_REACTION = 0.3               # s of response time before the ego can brake
+    RSS_ACCEL = 2.0                  # m/s^2 assumed during that response
+    RSS_BRAKE = 5.0                  # m/s^2 braking, matching KinematicBicycle
 
     # Rolling goals: instead of parking an agent at its single goal, the next goal is
     # placed GOAL_DIST further along the same route, and the route is extended through
@@ -469,28 +473,72 @@ class AWSIMDrivingEnv:
         return idx, signed, feat
 
     def _proximity(self, state):
-        """Per-agent penalty on the shortest time-to-collision with any neighbour.
+        """Risk of the interaction with the nearest conflicting agent.
 
-        Time rather than distance because the margin a pedestrian needs and the margin a
-        motorcycle needs differ by an order of magnitude, and a fixed distance would be
-        both too much for one and too little for the other.
+        One measure cannot cover every conflict. The traffic-safety literature splits
+        them - TTC suits rear-end, PET suits crossing - and the RSS-derived RL objective
+        in arXiv:2505.06737 splits the reward the same way, into same-direction,
+        opposite-direction and intersecting. Our own collisions split 50.8 / 21.3 / 27.9
+        across exactly those three, so each gets the term that fits:
+
+        - same direction: RSS longitudinal safe distance, which asks whether the ego
+          could still stop if the car ahead braked hard. Plain TTC cannot see this at
+          all - matched speeds give infinite TTC at any gap, so tailgating was free.
+        - opposite direction: the same, with both vehicles' stopping distances summed.
+        - crossing: time to predicted contact from |p + w t| = R.
+
+        Everything is measured in the ego frame, so lateral offset suppresses conflicts
+        that are really passes. That matters: judged on range and range-rate alone, a
+        parked car one lane over scored 0.490 against 0.497 for one in our own lane, and
+        an oncoming car in the next lane 0.554 - the worst of all, since closing speed
+        adds. On a two-way street that was a standing charge for meeting any traffic.
         """
         A = state.shape[0]
-        xy, psi, v = state[:, :2], state[:, 2], state[:, 3]
-        vel = torch.stack([torch.cos(psi), torch.sin(psi)], dim=-1) * v.unsqueeze(-1)
-        rel = xy.unsqueeze(0) - xy.unsqueeze(1)                     # [A, A, 2] j - i
-        dist = rel.norm(dim=-1)
-        u = rel / dist.clamp(min=1e-6).unsqueeze(-1)
-        closing = ((vel.unsqueeze(1) - vel.unsqueeze(0)) * u).sum(-1)   # >0 = approaching
+        xy, psi, v = state[:, :2], state[:, 2], state[:, 3].abs()
+        c, sn = torch.cos(psi), torch.sin(psi)
+        rel = xy.unsqueeze(0) - xy.unsqueeze(1)                    # [A, A, 2] j - i
+        dx = rel[..., 0] * c.unsqueeze(1) + rel[..., 1] * sn.unsqueeze(1)   # ahead of i
+        dy = -rel[..., 0] * sn.unsqueeze(1) + rel[..., 1] * c.unsqueeze(1)  # left of i
         size = self.simulator.get_agent_size()[0][..., :2]
-        radius = 0.5 * size.max(dim=-1).values
-        gap = (dist - radius.unsqueeze(0) - radius.unsqueeze(1)).clamp(min=0)
-        ttc = torch.where(closing > 0.1, gap / closing.clamp(min=0.1),
-                          torch.full_like(gap, float('inf')))
-        ttc.fill_diagonal_(float('inf'))
+        half_l, half_w = 0.5 * size[:, 0], 0.5 * size[:, 1]
+        c_x = half_l.unsqueeze(0) + half_l.unsqueeze(1)
+        c_y = half_w.unsqueeze(0) + half_w.unsqueeze(1) + self.PROXIMITY_MARGIN
+        gap = (dx - c_x).clamp(min=0.0)                            # clear longitudinal gap
+        overlap = (dy.abs() < c_y)                                 # paths share the lane
+        ahead = dx > 0
+
+        rho, a_acc, a_brk = self.RSS_REACTION, self.RSS_ACCEL, self.RSS_BRAKE
+        vi, vj = v.unsqueeze(1), v.unsqueeze(0)
+        # distance the ego covers before it can stop, reacting for rho at a_acc first
+        d_ego = vi * rho + 0.5 * a_acc * rho ** 2 + (vi + a_acc * rho) ** 2 / (2 * a_brk)
+        same = torch.cos(psi.unsqueeze(0) - psi.unsqueeze(1)) > 0.7
+        opposite = torch.cos(psi.unsqueeze(0) - psi.unsqueeze(1)) < -0.7
+        r_same = (d_ego - vj ** 2 / (2 * a_brk)).clamp(min=c_x)    # lead brakes flat out
+        r_opp = d_ego + (vj * rho + 0.5 * a_acc * rho ** 2
+                         + (vj + a_acc * rho) ** 2 / (2 * a_brk))
+        r_x = torch.where(same, r_same, r_opp)
+        longitudinal = torch.relu(1 - gap / r_x.clamp(min=1e-3))
+        longitudinal = longitudinal * (overlap & ahead & (same | opposite)).float()
+
+        # crossing: first root of |p + w t| = R, no real root means the paths miss
+        vel = torch.stack([c, sn], dim=-1) * v.unsqueeze(-1)
+        w = vel.unsqueeze(0) - vel.unsqueeze(1)
+        R = half_w.unsqueeze(0) + half_w.unsqueeze(1) + self.PROXIMITY_MARGIN
+        qa = (w * w).sum(-1)
+        qb = 2.0 * (rel * w).sum(-1)
+        qc = (rel * rel).sum(-1) - R * R
+        disc = qb * qb - 4 * qa * qc
+        inf = torch.full_like(qa, float('inf'))
+        t = torch.where((disc > 0) & (qa > 1e-6),
+                        (-qb - disc.clamp(min=0).sqrt()) / (2 * qa.clamp(min=1e-6)), inf)
+        ttc = torch.where(t > 0, t, inf)
+        crossing = torch.relu(1 - ttc / self.TTC_THRESHOLD) * (~(same | opposite)).float()
+
+        risk = torch.maximum(longitudinal, crossing)
+        eye = torch.eye(A, dtype=torch.bool, device=self.device)
         mask = self.simulator.get_present_mask()[0]
-        ttc = torch.where(mask.unsqueeze(0), ttc, torch.full_like(ttc, float('inf')))
-        return torch.relu(1 - ttc.min(dim=1).values / self.TTC_THRESHOLD) * mask
+        risk = torch.where(eye | ~mask.unsqueeze(0), torch.zeros_like(risk), risk)
+        return risk.max(dim=1).values * mask
 
     def _speed_ratio(self, state):
         """Per-agent speed as a fraction of the limit where it is. Reported because
@@ -863,6 +911,8 @@ class AWSIMDrivingEnv:
         self._goals_reached = torch.zeros(self.num_agents, device=self.device)
         self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._off_run = torch.zeros(self.num_agents, device=self.device)
+        if not hasattr(self, '_parked'):
+            self._parked = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._lost_count = 0
         self._any_finished = False
         self._prev_sl_idx = torch.full((self.num_agents,), -1, dtype=torch.long, device=self.device)
@@ -875,7 +925,9 @@ class AWSIMDrivingEnv:
         action = torch.as_tensor(action, dtype=torch.float32, device=self.device).clamp(-1, 1)
         was_reached = self._reached.clone()          # agents that already finished before this step
         action = action.clone()
-        action[was_reached] = 0.0                     # finished agents take no action (stay put)
+        # parked cars never act: they are scenery the policy has to drive around, and they
+        # are excluded from training so their (meaningless) transitions carry no gradient
+        action[was_reached | self._parked] = 0.0
         self.simulator.step(action.unsqueeze(0))
         self._post_physics()
         self._t += 1
@@ -931,7 +983,7 @@ class AWSIMDrivingEnv:
         done = self._reached.clone() | (self._t >= self.max_steps)
         # `active` marks transitions that count for training: an agent's steps are
         # valid up to and including the step it reaches the goal, then excluded.
-        active = ~was_reached
+        active = ~was_reached & ~self._parked
         # Metrics stay as 0-dim tensors. Every float() here is a device-to-host copy that
         # flushes the CUDA queue, and with ~25 of them per step (12 of which are per-type)
         # the step spent 42 of its 71 ms waiting on synchronisation - 92 syncs per step,

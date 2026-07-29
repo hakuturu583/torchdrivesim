@@ -51,6 +51,14 @@ TYPE_SPEC = {
     "cyclist":    dict(model=0, size=(1.80, 0.70), lr=0.60, vmax=6.0,  participant="bicycle",     goal_dist=60.0, color=(24, 104, 225)),
     "pedestrian": dict(model=1, size=(0.70, 0.70), lr=0.50, vmax=2.0,  participant="pedestrian",  goal_dist=20.0, color=(173, 127, 168)),
 }
+# Parked cars are rendered as a fifth category so they can be picked out in a video, but
+# the policy only ever sees the four TYPES: in the observation a parked car is a vehicle
+# at rest, indistinguishable from one stopped in traffic. Telling the policy which
+# stationary vehicles will never move would be information a real one does not have.
+RENDER_TYPES = TYPES + ["parked"]
+PARKED_COLOR = (204, 0, 0)
+PARKED_LATERAL = 1.0      # m offset towards the near side (left-hand traffic)
+
 DEFAULT_MIX = {"vehicle": 0.4, "motorcycle": 0.15, "cyclist": 0.15, "pedestrian": 0.3}
 PARTICIPANT_ENUM = {
     "vehicle": "Vehicle", "motorcycle": "VehicleMotorcycle",
@@ -70,7 +78,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
 
     def __init__(self, map_path, num_agents=12, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, mix=None, render_fov=None, render_res=512, seed=0,
-                 spawn_attempts=25, spawn_gap=1.5, pool_cap=120,
+                 spawn_attempts=25, spawn_gap=1.5, pool_cap=120, n_parked=0,
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
                  rolling_goals=None, goal_dist=None,
                  w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
@@ -98,6 +106,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self.spawn_attempts = spawn_attempts
         self.spawn_gap = spawn_gap
         self.pool_cap = pool_cap
+        self.n_parked = n_parked
         self._rng = np.random.default_rng(seed)
         mix = mix or DEFAULT_MIX
 
@@ -133,6 +142,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self.type_onehot[torch.arange(num_agents, device=device), self._type_idx_t] = 1.0
 
         self._build_spawn_pools()
+        self._build_parking_spots()
         self.reset()
 
     def _rule_participant_mask(self, lanelets):
@@ -150,6 +160,55 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
 
     def _agent_types(self):
         return self._type_idx_t
+
+    def _build_parking_spots(self):
+        """Straight, non-junction lanelets a car may be left standing on.
+
+        Junction lanelets are excluded - a car abandoned inside an intersection is a
+        different (and much harsher) scenario than one at the kerb, and it would
+        interact with the signal and right-of-way logic rather than test obstacle
+        avoidance.
+        """
+        rules = self._traffic_rules("vehicle")
+        spots = []
+        for ll in self.lanelet_map.laneletLayer:
+            if not rules.canPass(ll):
+                continue
+            if 'turn_direction' in ll.attributes:      # junction approach or turn
+                continue
+            pts = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64)
+            if pts.shape[0] < 2:
+                continue
+            cache = polyline_cumlen(pts)
+            if cache[2][-1] < 15.0:                    # too short to leave a car on
+                continue
+            if self._sl_xy.shape[0]:
+                d = float(torch.cdist(torch.tensor(pts, dtype=torch.float32, device=self.device),
+                                      self._sl_xy).min())
+                if d < self.INTERSECTION_RADIUS:       # still within a junction
+                    continue
+            spots.append((pts, cache))
+        self._parking_spots = spots
+
+    def _place_parked(self):
+        """Re-place the parked cars each reset. They are ordinary vehicles as far as the
+        observation is concerned; they simply never receive an action."""
+        if not self.n_parked or not self._parking_spots:
+            return
+        veh = [i for i in range(self.num_agents)
+               if TYPES[self.agent_type_idx[i]] == "vehicle"][:self.n_parked]
+        for i in veh:
+            poly, cache = self._parking_spots[self._rng.integers(len(self._parking_spots))]
+            total = cache[2][-1]
+            x, y, h = point_at_arclen(poly, self._rng.uniform(5.0, total - 5.0), cache)
+            # towards the near side of the lane: left-hand traffic, so left of travel
+            x -= PARKED_LATERAL * np.sin(h)
+            y += PARKED_LATERAL * np.cos(h)
+            self._init_state[0, i, 0] = x
+            self._init_state[0, i, 1] = y
+            self._init_state[0, i, 2] = h
+            self._init_state[0, i, 3] = 0.0
+            self._parked[i] = True
 
     # ------------------------------------------------------ spawn machinery
     def _allocate(self, n, mix):
@@ -246,11 +305,13 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             s0s.append(s0); gaps.append(spec["goal_dist"])
 
         A = self.num_agents
+        self._parked = torch.zeros(A, dtype=torch.bool, device=self.device)
         self._route_end_ll, self._route_pkey = ends, pkeys
         self._init_route_state(polys, s0s, gaps)
         self._init_state = torch.zeros(1, A, 4, device=self.device)
         self._init_state[0, :, :2] = torch.tensor(np.stack(starts), dtype=torch.float32, device=self.device)
         self._init_state[0, :, 2] = torch.tensor(np.stack(headings), dtype=torch.float32, device=self.device)
+        self._place_parked()
 
     def _extend_route(self, i):
         """Continue agent i's route through the lanelet graph so its goals can keep
@@ -296,13 +357,18 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         for t in TYPES:
             renderer.color_map[t] = TYPE_SPEC[t]["color"]
             renderer.rendering_levels.setdefault(t, 4)
+        renderer.color_map["parked"] = PARKED_COLOR
+        renderer.rendering_levels.setdefault("parked", 4)
+        # render-only category: the observation's type one-hot still says "vehicle"
+        render_idx = torch.where(self._parked, torch.full_like(self._type_idx_t, len(TYPES)),
+                                 self._type_idx_t)
         cfg = TorchDriveConfig(left_handed_coordinates=False,
                                renderer=RendererConfig(left_handed_coordinates=False))
         self.simulator = Simulator(
             cfg=cfg, road_mesh=self.mesh, kinematic_model=kin, agent_size=self.agent_size,
             initial_present_mask=torch.ones(1, A, dtype=torch.bool, device=self.device),
             renderer=renderer, lanelet_map=[self.lanelet_map],
-            agent_types=self._type_idx_t.view(1, A), agent_type_names=TYPES,
+            agent_types=render_idx.view(1, A), agent_type_names=RENDER_TYPES,
         )
 
     # ---------------------------------------------------- overridden hooks
