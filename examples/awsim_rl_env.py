@@ -101,6 +101,8 @@ class AWSIMDrivingEnv:
     RSS_REACTION = 0.3               # s of response time before the ego can brake
     RSS_ACCEL = 2.0                  # m/s^2 assumed during that response
     RSS_BRAKE = 5.0                  # m/s^2 braking, matching KinematicBicycle
+    CORRIDOR_HALF_WIDTH = 6.0        # m; a loose sanity bound, not the lane test itself
+    DOWNSTREAM_HOPS = 3              # lanelets ahead still counted as the same road
 
     # Rolling goals: instead of parking an agent at its single goal, the next goal is
     # placed GOAL_DIST further along the same route, and the route is extended through
@@ -311,6 +313,29 @@ class AWSIMDrivingEnv:
         self._yield_lanelet = yields
         self._pt_lanelet = torch.tensor([order[ll.id] for ll in lanelets], device=self.device)
         self._add_oncoming_turn_priority()
+        self._build_downstream()
+
+    def _build_downstream(self):
+        """[L, L] mask: lanelet j follows lanelet i within DOWNSTREAM_HOPS.
+
+        Used to decide whether a vehicle is 'ahead on the same road' without any
+        geometric assumption about how straight that road is.
+        """
+        order = self._lanelet_order
+        L = len(order)
+        adj = torch.zeros(L, L, dtype=torch.bool, device=self.device)
+        rules = lanelet2.traffic_rules.create(Locations.Germany, Participants.Vehicle)
+        graph = lanelet2.routing.RoutingGraph(self.lanelet_map, rules)
+        for ll in self.lanelet_map.laneletLayer:
+            if ll.id not in order:
+                continue
+            for nxt in graph.following(ll):
+                if nxt.id in order:
+                    adj[order[ll.id], order[nxt.id]] = True
+        reach = adj.clone()
+        for _ in range(self.DOWNSTREAM_HOPS - 1):     # transitive closure, bounded
+            reach = reach | (reach.float() @ adj.float() > 0)
+        self._downstream = reach
 
     def _add_oncoming_turn_priority(self):
         """Make right-turning lanelets give way to the oncoming traffic they cross.
@@ -504,8 +529,23 @@ class AWSIMDrivingEnv:
         c_x = half_l.unsqueeze(0) + half_l.unsqueeze(1)
         c_y = half_w.unsqueeze(0) + half_w.unsqueeze(1) + self.PROXIMITY_MARGIN
         gap = (dx - c_x).clamp(min=0.0)                            # clear longitudinal gap
-        overlap = (dy.abs() < c_y)                                 # paths share the lane
         ahead = dx > 0
+        # Sharing a lane is decided by lanelet identity, not by lateral offset in the
+        # ego's straight-line frame. On a bend the car ahead is offset sideways in that
+        # frame - 3.7 m at 15 m ahead on a 30 m radius - and a geometric test loses it
+        # entirely past the width threshold. Worse, the threshold is crossed sooner the
+        # longer the required gap, so the term went blind exactly where it matters most:
+        # approaching a stopped car at speed. Lanelet identity has no curvature term.
+        # Union of two tests, because neither covers the other. The geometric one is
+        # exact on a straight road but loses the car ahead round a bend - 3.7 m of
+        # apparent lateral offset at 15 m ahead on a 30 m radius, and the threshold is
+        # crossed sooner the longer the required gap, so it went blind precisely when
+        # approaching a stopped car at speed. Lanelet identity has no curvature term but
+        # is noisy where lanelets overlap: on this map two cars 6 m apart on one route
+        # can be assigned to different, unconnected lanelets.
+        lane = self._agent_lanelet(state)
+        overlap = ((dy.abs() < c_y)
+                   | (self._same_corridor(lane) & (dy.abs() < self.CORRIDOR_HALF_WIDTH)))
 
         rho, a_acc, a_brk = self.RSS_REACTION, self.RSS_ACCEL, self.RSS_BRAKE
         vi, vj = v.unsqueeze(1), v.unsqueeze(0)
@@ -539,6 +579,15 @@ class AWSIMDrivingEnv:
         mask = self.simulator.get_present_mask()[0]
         risk = torch.where(eye | ~mask.unsqueeze(0), torch.zeros_like(risk), risk)
         return risk.max(dim=1).values * mask
+
+    def _same_corridor(self, lane):
+        """[A, A] mask of agent pairs travelling the same stretch of road.
+
+        True when both are on the same lanelet, or when one is directly downstream of
+        the other, so a car round the next bend still counts as being in front.
+        """
+        same = lane.unsqueeze(0) == lane.unsqueeze(1)
+        return same | self._downstream[lane.unsqueeze(1), lane.unsqueeze(0)]
 
     def _speed_ratio(self, state):
         """Per-agent speed as a fraction of the limit where it is. Reported because
