@@ -695,13 +695,18 @@ class AWSIMDrivingEnv:
         same = lane.unsqueeze(0) == lane.unsqueeze(1)
         return same | self._downstream[lane.unsqueeze(1), lane.unsqueeze(0)]
 
+    def _speed_limit(self, near):
+        """The limit each agent is judged against at lane point `near`. One road-user
+        type here, so it is simply the lane's own limit."""
+        return self._rule_speed[near]
+
     def _speed_ratio(self, state):
         """Per-agent speed as a fraction of the limit where it is. Reported because
         every rule metric is a violation rate, and a policy that simply stops scores
         perfectly on all of them - which is what happened once the penalties were
         applied from the first update."""
-        return (state[:, 3].abs()
-                / self._rule_speed[self._nearest_rule_point(state)]).clamp(max=3)
+        near = self._nearest_rule_point(state)
+        return (state[:, 3].abs() / self._speed_limit(near)).clamp(max=3)
 
     def _rule_violations(self, state):
         """Red-light crossings, wrong-way driving and speeding, as [A] tensors.
@@ -729,7 +734,7 @@ class AWSIMDrivingEnv:
         near = self._nearest_rule_point(state)
         # heading against the lane direction by more than 90 degrees
         wrongway = (torch.cos(psi - self._rule_dir[near]) < 0).float()
-        limit = self._rule_speed[near]
+        limit = self._speed_limit(near)
         excess = (state[:, 3].abs() - limit).clamp(min=0)             # m/s over the limit
         over = (excess - self.SPEED_TOLERANCE).clamp(min=0)
         speeding = over.pow(2).clamp(max=self.SPEED_PENALTY_CAP / max(self.w_speeding, 1e-9))
@@ -990,7 +995,7 @@ class AWSIMDrivingEnv:
     def _ego_features(self, state, prev_action):
         x, y, psi, v = state[:, 0], state[:, 1], state[:, 2], state[:, 3]
         near = self._nearest_rule_point(state)
-        limit, lane = self._rule_speed[near], self._pt_lanelet[near]
+        limit, lane = self._speed_limit(near), self._pt_lanelet[near]
         dx, dy = self.goals[:, 0] - x, self.goals[:, 1] - y
         c, s = torch.cos(psi), torch.sin(psi)
         gx_e = c * dx + s * dy            # goal in ego frame

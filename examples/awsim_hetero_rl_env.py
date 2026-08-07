@@ -327,10 +327,72 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             lls = [lls[i] for i in idx]
         return lls
 
+    PED_LINK_RADIUS = 12.0    # m between the end of one crossing and the start of the next
+    PED_POOL_LENGTH = 80.0    # m of route to chain together before an episode starts
+
+    def _build_ped_links(self):
+        """Walkable segments and a geometric successor lookup for pedestrians.
+
+        The map has no footway network. Of the 92 lanelets a pedestrian may use, 84 are
+        crosswalks and 8 are walkways, and the routing graph gives *every one of them*
+        zero successors - they are islands crossing a road, not a path along it. So a
+        pedestrian walked a median 18.7 m, ran out of route and was teleported: 1260 of
+        the 1550 respawns in an episode were pedestrians, and their "goals" counted
+        those hops rather than 20 m walks.
+
+        A pedestrian at a junction carries on round the corner onto the next crossing,
+        so ends that nearly touch are linked here. Synthetic, like the signal phases,
+        and for the same reason: the map carries the geometry but not the network.
+        """
+        rules = self._traffic_rules("pedestrian")
+        self._ped_polys = []
+        for ll in sorted((l for l in self.lanelet_map.laneletLayer if rules.canPass(l)),
+                         key=lambda l: l.id):
+            pts = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64)
+            if pts.shape[0] >= 2:
+                self._ped_polys.append((ll, pts))
+        self._ped_ends = (np.array([[p[0], p[-1]] for _, p in self._ped_polys])
+                          if self._ped_polys else np.zeros((0, 2, 2)))
+
+    def _ped_next(self, xy, exclude_id):
+        """The next walkable segment leading away from `xy`, oriented to continue from
+        it, or None if nothing starts close enough. Returns (lanelet, polyline)."""
+        if not self._ped_polys:
+            return None
+        d0 = np.linalg.norm(self._ped_ends[:, 0] - xy, axis=1)
+        d1 = np.linalg.norm(self._ped_ends[:, 1] - xy, axis=1)
+        d = np.minimum(d0, d1)
+        for k in np.argsort(d):
+            if d[k] > self.PED_LINK_RADIUS:
+                break
+            ll, pts = self._ped_polys[k]
+            if ll.id == exclude_id:
+                continue
+            return ll, (pts if d0[k] <= d1[k] else pts[::-1])
+        return None
+
+    def _chain_ped_route(self, ll, pts):
+        """Link crossings end to end until the route is worth walking."""
+        cache = polyline_cumlen(pts)
+        end = ll
+        while cache[2][-1] < self.PED_POOL_LENGTH:
+            nxt = self._ped_next(pts[-1], end.id)
+            if nxt is None:
+                break
+            end, ext = nxt
+            if np.allclose(pts[-1], ext[0], atol=1e-6):
+                ext = ext[1:]
+            if ext.shape[0] < 1:
+                break
+            pts = np.concatenate([pts, ext], axis=0)
+            cache = polyline_cumlen(pts)
+        return pts, end
+
     def _build_spawn_pools(self):
         """One pool of (polyline, arc-length cache) per participant, built once
         from that participant's traffic rules (canPass) and routing graph."""
         participants = {TYPE_SPEC[t]["participant"] for t in TYPES}
+        self._build_ped_links()
         self._pools, self._graphs = {}, {}
         for pkey in participants:
             rules = self._traffic_rules(pkey)
@@ -338,8 +400,9 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             self._graphs[pkey] = graph
             polys = []
             for ll in self._passable_lanelets(rules):
-                if pkey == "pedestrian":  # pedestrians cross a single lanelet
-                    poly, end = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64), ll
+                if pkey == "pedestrian":  # chained geometrically; see _build_ped_links
+                    poly, end = self._chain_ped_route(
+                        ll, np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64))
                 else:                      # wheeled agents follow a legal downstream route
                     poly, end = build_route(graph, ll, return_end=True)
                 if poly.shape[0] >= 2:
@@ -357,7 +420,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         `goal_dist` ahead and is rolled forward on arrival (AWSIMDrivingEnv._advance_goals)."""
         pool = self._pools[spec["participant"]]
         radius = 0.5 * max(spec["size"]) + self.spawn_gap
-        attempt = None
+        best, best_clear = None, -np.inf
         for _ in range(self.spawn_attempts):
             poly, cache, end = pool[self._rng.integers(len(pool))]
             total = cache[2][-1]
@@ -365,9 +428,17 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             x, y, h = point_at_arclen(poly, s0, cache)
             gx, gy, _ = point_at_arclen(poly, min(s0 + spec["goal_dist"], total), cache)
             attempt = (x, y, h, gx, gy, poly, end, s0)
-            if all((x - px) ** 2 + (y - py) ** 2 > (radius + pr) ** 2 for px, py, pr in placed):
+            clear = min((np.hypot(x - px, y - py) - (radius + pr) for px, py, pr in placed),
+                        default=np.inf)
+            if clear > 0:
                 return attempt
-        return attempt   # accept the last attempt if every one overlapped
+            # Every attempt overlapping used to mean "take the last one", which put 10
+            # pedestrians into the episode already in contact - their pool is 92 short
+            # lanelets for 153 of them, so overlap is the normal case, not the rare one.
+            # Keeping the roomiest attempt costs nothing and starts them apart.
+            if clear > best_clear:
+                best, best_clear = attempt, clear
+        return best
 
     def _respawn(self, i):
         """Put agent i on a fresh route once its own runs out at the edge of the map,
@@ -376,7 +447,10 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         # positions are pulled to the host once per batch of respawns, not once per
         # agent: this used to be a full 512-agent device read inside the loop
         xy = self._respawn_xy
-        placed = [(px, py, 3.0) for j, (px, py) in enumerate(xy) if j != i]
+        # `spawn_gap` as well as the body, matching _sample_spawns: with a bare 3 m
+        # radius, 7.2% of respawns still landed touching somebody
+        placed = [(px, py, 0.5 * max(spec["size"]) + self.spawn_gap)
+                  for j, (px, py) in enumerate(xy) if j != i]
         x, y, h, _, _, poly, end, s0 = self._sample_one(spec, placed)
         self._route_poly[i] = poly
         self._route_cache[i] = polyline_cumlen(poly)
@@ -409,6 +483,12 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
     def _extend_route(self, i):
         """Continue agent i's route through the lanelet graph so its goals can keep
         rolling forward. False at a dead end, which parks that agent."""
+        if self._route_pkey[i] == "pedestrian":
+            nxt = self._ped_next(self._route_poly[i][-1], self._route_end_ll[i].id)
+            if nxt is None:
+                return False
+            end, ext = nxt
+            return self._append_route(i, ext, end)
         graph = self._graphs[self._route_pkey[i]]
         nxt = list(graph.following(self._route_end_ll[i]))
         if not nxt:
@@ -416,6 +496,10 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         ext, end = build_route(graph, nxt[0], return_end=True)
         if ext.shape[0] < 2:
             return False
+        return self._append_route(i, ext, end)
+
+    def _append_route(self, i, ext, end):
+        """Tack `ext` onto agent i's route, now ending on lanelet `end`."""
         poly = self._route_poly[i]
         if np.allclose(poly[-1], ext[0], atol=1e-6):   # drop the duplicated junction point
             ext = ext[1:]
@@ -426,6 +510,30 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self._route_cache[i] = polyline_cumlen(self._route_poly[i])
         self._route_end_ll[i] = end
         return True
+
+    def _limit_steering(self, action, state):
+        """The bicycle limits, plus the pedestrian's own speed cap.
+
+        `OrientedKinematicModel` normalises x and y independently, so a pedestrian
+        walking diagonally covered vmax * sqrt(2) = 2.83 m/s against its 2.0 m/s cap -
+        and the measured median step was exactly that. `_post_physics` clamps the state's
+        speed component, which the omnidirectional model does not use to move, so it
+        never bit. Capping the norm of the body-frame step does.
+        """
+        action = super()._limit_steering(action, state)
+        walker = ~self._steer_wheeled
+        if bool(walker.any()):
+            norm = action[:, :2].norm(dim=-1, keepdim=True).clamp(min=1.0)
+            action[:, :2] = torch.where(walker.unsqueeze(1), action[:, :2] / norm,
+                                        action[:, :2])
+        return action
+
+    def _speed_limit(self, near):
+        """No type may be judged against a limit it cannot reach. A cyclist was measured
+        against the 50 km/h of the road it rides on while its own top speed is 21.6, so
+        a speeding violation was arithmetically impossible and its speed/limit ratio was
+        not comparable with any other type's."""
+        return torch.minimum(super()._speed_limit(near), self.vmax)
 
     def _steering_params(self):
         """Per-agent rear-axle distance, steering limit, and which agents are on the
