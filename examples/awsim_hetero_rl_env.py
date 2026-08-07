@@ -351,24 +351,63 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             pts = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64)
             if pts.shape[0] >= 2:
                 self._ped_polys.append((ll, pts))
+        self._ped_ids = {ll.id for ll, _ in self._ped_polys}
         self._ped_ends = (np.array([[p[0], p[-1]] for _, p in self._ped_polys])
                           if self._ped_polys else np.zeros((0, 2, 2)))
+        # validated once, because the check is a lanelet2 point query and the routes are
+        # extended inside the step loop
+        self._ped_succ = {(k, e): self._ped_candidates(k, pts[0 if e == 0 else -1])
+                          for k, (_, pts) in enumerate(self._ped_polys) for e in (0, 1)}
+
+    def _ped_candidates(self, k, tip):
+        """Segments reachable on foot from one end of segment `k`, nearest first."""
+        d0 = np.linalg.norm(self._ped_ends[:, 0] - tip, axis=1)
+        d1 = np.linalg.norm(self._ped_ends[:, 1] - tip, axis=1)
+        d = np.minimum(d0, d1)
+        out = []
+        for j in np.argsort(d):
+            if d[j] > self.PED_LINK_RADIUS:
+                break
+            if j == k:
+                continue
+            ll, pts = self._ped_polys[j]
+            poly = pts if d0[j] <= d1[j] else pts[::-1]
+            if self._walkable_gap(tip, poly[0]):
+                out.append((ll, poly))
+        return out
+
+    def _walkable_gap(self, a, b):
+        """Whether the straight hop from `a` to `b` stays on ground a pedestrian may use.
+
+        Without this the link is drawn between two crossings across whatever lies
+        between them, and the map has no lanelet there: pedestrians following the route
+        the env itself gave them read as off-road on 4.4% of their steps and were
+        charged `w_offroad` for it. Nothing else in the run produced pedestrian offroad
+        at all - it was 0.000 before the links existed.
+        """
+        seg = b - a
+        n = max(int(np.linalg.norm(seg) / 1.5), 1)
+        for f in np.linspace(0.0, 1.0, n + 1):
+            x, y = a + f * seg
+            p = lanelet2.core.BasicPoint2d(float(x), float(y))
+            near = lanelet2.geometry.findNearest(self.lanelet_map.laneletLayer, p, 6)
+            if not any(dist <= 0.01 and ll.id in self._ped_ids for dist, ll in near):
+                return False
+        return True
 
     def _ped_next(self, xy, exclude_id):
         """The next walkable segment leading away from `xy`, oriented to continue from
         it, or None if nothing starts close enough. Returns (lanelet, polyline)."""
         if not self._ped_polys:
             return None
-        d0 = np.linalg.norm(self._ped_ends[:, 0] - xy, axis=1)
-        d1 = np.linalg.norm(self._ped_ends[:, 1] - xy, axis=1)
-        d = np.minimum(d0, d1)
-        for k in np.argsort(d):
-            if d[k] > self.PED_LINK_RADIUS:
-                break
-            ll, pts = self._ped_polys[k]
-            if ll.id == exclude_id:
-                continue
-            return ll, (pts if d0[k] <= d1[k] else pts[::-1])
+        d = np.minimum(np.linalg.norm(self._ped_ends[:, 0] - xy, axis=1),
+                       np.linalg.norm(self._ped_ends[:, 1] - xy, axis=1))
+        k = int(np.argmin(d))
+        e = 0 if np.linalg.norm(self._ped_ends[k, 0] - xy) <= np.linalg.norm(
+            self._ped_ends[k, 1] - xy) else 1
+        for ll, poly in self._ped_succ.get((k, e), ()):
+            if ll.id != exclude_id:
+                return ll, poly
         return None
 
     def _chain_ped_route(self, ll, pts):
