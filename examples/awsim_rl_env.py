@@ -191,6 +191,9 @@ class AWSIMDrivingEnv:
     # until they were already out. This charges lateral offset from the lane centre
     # before that, and it is a penalty rather than a bonus on purpose - a bonus for
     # sitting on a centreline is collected just as well by an agent that has stopped.
+    # The rise alone makes staying overlapped free once you are in, and the overlap
+    # time went up 18% because of it. A small level term restores a reason to get out.
+    W_COLLISION_LEVEL = 0.0
     W_LANE = 0.4
     LANE_TOLERANCE = 1.2             # m of lateral offset that costs nothing
     LANE_SCALE = 1.5                 # m over which the penalty ramps to its full value
@@ -200,7 +203,12 @@ class AWSIMDrivingEnv:
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
                  rolling_goals=None, goal_dist=None,
                  w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
-                 w_proximity=None, ttc_threshold=None, w_lane=None):
+                 w_proximity=None, ttc_threshold=None, w_lane=None,
+                 w_collision_level=None, lat_accel_max=None):
+        self.w_collision_level = (self.W_COLLISION_LEVEL if w_collision_level is None
+                                  else w_collision_level)
+        if lat_accel_max is not None:
+            self.LAT_ACCEL_MAX = lat_accel_max
         self.w_lane = self.W_LANE if w_lane is None else w_lane
         self.w_proximity = self.W_PROXIMITY if w_proximity is None else w_proximity
         if ttc_threshold is not None:
@@ -1218,6 +1226,7 @@ class AWSIMDrivingEnv:
         self._prev_collision, self._just_moved = collision, torch.zeros_like(self._just_moved)
         newly_reached = (dist < self.goal_radius) & (~was_reached)
         reward = (self.w_progress * progress - self.w_collision * hit
+                  - self.w_collision_level * collision
                   - self.w_offroad * offroad + self.w_goal * newly_reached.float()
                   - self.w_redlight * redlight - self.w_wrongway * wrongway
                   - self.w_speeding * speeding            # see W_SPEEDING

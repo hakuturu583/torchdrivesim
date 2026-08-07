@@ -91,7 +91,12 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
                  rolling_goals=None, goal_dist=None,
                  w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
-                 w_proximity=None, ttc_threshold=None, w_lane=None):
+                 w_proximity=None, ttc_threshold=None, w_lane=None,
+                 w_collision_level=None, lat_accel_max=None):
+        self.w_collision_level = (self.W_COLLISION_LEVEL if w_collision_level is None
+                                  else w_collision_level)
+        if lat_accel_max is not None:
+            self.LAT_ACCEL_MAX = lat_accel_max
         self.w_lane = self.W_LANE if w_lane is None else w_lane
         self.w_proximity = self.W_PROXIMITY if w_proximity is None else w_proximity
         if ttc_threshold is not None:

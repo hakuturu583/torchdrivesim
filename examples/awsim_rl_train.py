@@ -81,6 +81,8 @@ class PPOConfig:
     w_yield: float = 0.5
     n_parked: int = 16         # stationary cars on straight lanelets (hetero env only)
     w_proximity: float = 0.3
+    w_collision_level: float = 0.0   # kept alongside the rise; 0 reproduces hit300
+    lat_accel_max: float = 4.0       # m/s^2; the speed-dependent steering cap
     w_lane: float = 0.4         # lateral offset from the lane centre (see W_LANE)
     ttc_threshold: float = 3.0
     # Rule penalties ramp in over the first `penalty_warmup` updates, from
@@ -201,7 +203,8 @@ def train(cfg: PPOConfig):
                   w_redlight=cfg.w_redlight, w_wrongway=cfg.w_wrongway,
                   w_speeding=cfg.w_speeding, w_yield=cfg.w_yield,
                   w_proximity=cfg.w_proximity, ttc_threshold=cfg.ttc_threshold,
-                  w_lane=cfg.w_lane,
+                  w_lane=cfg.w_lane, w_collision_level=cfg.w_collision_level,
+                  lat_accel_max=cfg.lat_accel_max,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
@@ -235,7 +238,7 @@ def train(cfg: PPOConfig):
             f = min(1.0, cfg.penalty_warmup_start + (1 - cfg.penalty_warmup_start)
                     * update / cfg.penalty_warmup)
             for k in ('offroad', 'collision', 'redlight', 'wrongway', 'speeding', 'yield',
-                      'proximity', 'lane'):
+                      'proximity', 'lane', 'collision_level'):
                 setattr(env, f'w_{k}', getattr(cfg, f'w_{k}') * f)
         # `info` is a snapshot of the step it came from: `reached` accumulates over an
         # episode and resets with it, so reading it off the last rollout step samples a
