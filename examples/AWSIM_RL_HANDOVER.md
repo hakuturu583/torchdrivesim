@@ -340,6 +340,14 @@ agents rarely meet, not that they negotiate well.
   `[project.optional-dependencies] tests` pins `pytest==5.4.3`, which cannot even collect
   under Python 3.13 — run tests via `uv run --with 'pytest>=8' pytest ...` until that pin
   is fixed.
+- `pkill -f "uv run python examples/awsim_rl_train"` **does not stop the training**: `uv run`
+  execs a child `.venv/bin/python3 examples/awsim_rl_train.py ...` that the pattern misses,
+  so the orphan keeps its 2 GB of VRAM and its share of the GPU. Two runs survived that way
+  and quietly halved the throughput of their replacements (30 → 35 s/update). Match the
+  child instead — `pkill -9 -f "examples/awsim_rl_train"` — and confirm with
+  `nvidia-smi --query-compute-apps=pid,used_memory --format=csv`, not with `ps | grep uv`.
+  `pkill` patterns are **extended** regexes, so `python3\?` matches a literal `?` and
+  silently kills nothing; when in doubt kill the PIDs `nvidia-smi` reported.
 
 ## Commit history (branch `claude/awsim-ll2-traffic-simulation-3de141`)
 
