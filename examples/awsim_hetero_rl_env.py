@@ -158,19 +158,38 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                 mask[i] = True
         return mask
 
+    def _signal_participant_mask(self, owners):
+        """Each type is judged only against stop lines on lanelets it may use, so
+        pedestrians answer to the crosswalk signals and vehicles to the road ones.
+        A cyclist may pass both, and so obeys whichever it is approaching."""
+        mask = torch.zeros(len(TYPES), len(owners), dtype=torch.bool, device=self.device)
+        for i, t in enumerate(TYPES):
+            rules = self._traffic_rules(TYPE_SPEC[t]["participant"])
+            ok = {ll.id: rules.canPass(ll) for ll in set(owners)}
+            mask[i] = torch.tensor([ok[ll.id] for ll in owners], device=self.device)
+        return mask
+
     def _agent_types(self):
         return self._type_idx_t
 
     def _build_parking_spots(self):
-        """Straight, non-junction lanelets a car may be left standing on.
+        """Straight, non-junction **kerbside** lanelets a car may be left standing on.
 
         Junction lanelets are excluded - a car abandoned inside an intersection is a
         different (and much harsher) scenario than one at the kerb, and it would
         interact with the signal and right-of-way logic rather than test obstacle
         avoidance.
+
+        Kerbside means no lane to the left, since Japan drives on the left and cars are
+        left at the near kerb. Picking any straight lanelet put 6 of 16 cars in a
+        running lane with traffic on both sides of them - an obstacle no real street
+        has. Each spot also carries its own half-width, because parking is against the
+        left bound, and lanes here run 2.4-3.6 m wide: one fixed offset either leaves
+        the car mid-lane on a wide one or pushes it over the kerb on a narrow one.
         """
         rules = self._traffic_rules("vehicle")
-        spots = []
+        graph = self._graphs.get("vehicle")
+        spots, dropped = [], 0
         for ll in self.lanelet_map.laneletLayer:
             if not rules.canPass(ll):
                 continue
@@ -187,23 +206,91 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                                       self._sl_xy).min())
                 if d < self.INTERSECTION_RADIUS:       # still within a junction
                     continue
-            spots.append((pts, cache))
+            # `left` is the neighbour a lane change may reach, `adjacentLeft` the one it
+            # may not; either means this is not the kerbside lane.
+            if graph is not None and (graph.left(ll) is not None
+                                      or graph.adjacentLeft(ll) is not None):
+                dropped += 1
+                continue
+            spots.append((pts, cache, self._half_width(ll, pts)))
+        if not spots:
+            # Synthetic maps (and the tests) can have no kerbside lanelet at all;
+            # falling back keeps parking available there rather than silently off.
+            spots = self._any_straight_spots(rules)
         self._parking_spots = spots
+        self._parking_dropped = dropped
 
-    def _place_parked(self):
+    def _any_straight_spots(self, rules):
+        """Fallback pool when no kerbside lanelet exists, e.g. on a one-lanelet map."""
+        spots = []
+        for ll in self.lanelet_map.laneletLayer:
+            if not rules.canPass(ll) or 'turn_direction' in ll.attributes:
+                continue
+            pts = np.array([[p.x, p.y] for p in ll.centerline], dtype=np.float64)
+            if pts.shape[0] < 2:
+                continue
+            cache = polyline_cumlen(pts)
+            if cache[2][-1] >= 15.0:
+                spots.append((pts, cache, self._half_width(ll, pts)))
+        return spots
+
+    @staticmethod
+    def _half_width(ll, centre):
+        """Median distance from the centreline to the left bound, i.e. the lane's half
+        width on the kerb side. Taken as a median because the ends of a lanelet flare
+        where it meets the next one.
+
+        Distance to the bound as a *polyline*, not to its vertices: bounds here are
+        stored sparsely (a straight edge is two points tens of metres apart), and the
+        vertex distance then reports a half width many times the real one.
+        """
+        left = np.array([[p.x, p.y] for p in ll.leftBound], dtype=np.float64)
+        if left.shape[0] < 2 or centre.shape[0] < 1:
+            return PARKED_LATERAL
+        a, b = left[:-1], left[1:]                       # [S, 2] segment ends
+        ab = b - a
+        denom = (ab * ab).sum(-1).clip(min=1e-9)
+        t = (((centre[:, None, :] - a[None]) * ab[None]).sum(-1) / denom).clip(0.0, 1.0)
+        foot = a[None] + t[..., None] * ab[None]         # [P, S, 2] closest point per segment
+        d = np.linalg.norm(centre[:, None, :] - foot, axis=-1).min(axis=1)
+        return float(np.median(d))
+
+    def _place_parked(self, placed=None):
         """Re-place the parked cars each reset. They are ordinary vehicles as far as the
-        observation is concerned; they simply never receive an action."""
+        observation is concerned; they simply never receive an action.
+
+        `placed` is the (x, y, radius) list the spawn sampler rejected against. Parked
+        cars used to be written in afterwards without consulting it, so they could be
+        dropped straight on top of an agent that had just been placed clear of everyone:
+        4 of 16 spent every step of the episode in contact, which is initial overlap,
+        not a collision the policy caused.
+        """
         if not self.n_parked or not self._parking_spots:
             return
+        placed = placed if placed is not None else []
+        half_l, half_w = (0.5 * TYPE_SPEC["vehicle"]["size"][0],
+                          0.5 * TYPE_SPEC["vehicle"]["size"][1])
+        radius = half_l + self.spawn_gap
         veh = [i for i in range(self.num_agents)
                if TYPES[self.agent_type_idx[i]] == "vehicle"][:self.n_parked]
         for i in veh:
-            poly, cache = self._parking_spots[self._rng.integers(len(self._parking_spots))]
-            total = cache[2][-1]
-            x, y, h = point_at_arclen(poly, self._rng.uniform(5.0, total - 5.0), cache)
-            # towards the near side of the lane: left-hand traffic, so left of travel
-            x -= PARKED_LATERAL * np.sin(h)
-            y += PARKED_LATERAL * np.cos(h)
+            attempt = None
+            for _ in range(self.spawn_attempts):
+                poly, cache, lane_half_w = self._parking_spots[
+                    self._rng.integers(len(self._parking_spots))]
+                total = cache[2][-1]
+                x, y, h = point_at_arclen(poly, self._rng.uniform(5.0, total - 5.0), cache)
+                # against the left bound: the car's near side touches the kerb rather
+                # than sitting a fixed 1 m off the lane centre
+                lateral = max(lane_half_w - half_w, 0.0)
+                x -= lateral * np.sin(h)
+                y += lateral * np.cos(h)
+                attempt = (x, y, h)
+                if all((x - px) ** 2 + (y - py) ** 2 > (radius + pr) ** 2
+                       for px, py, pr in placed):
+                    break
+            x, y, h = attempt
+            placed.append((x, y, radius))
             self._init_state[0, i, 0] = x
             self._init_state[0, i, 1] = y
             self._init_state[0, i, 2] = h
@@ -311,7 +398,7 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self._init_state = torch.zeros(1, A, 4, device=self.device)
         self._init_state[0, :, :2] = torch.tensor(np.stack(starts), dtype=torch.float32, device=self.device)
         self._init_state[0, :, 2] = torch.tensor(np.stack(headings), dtype=torch.float32, device=self.device)
-        self._place_parked()
+        self._place_parked(placed)
 
     def _extend_route(self, i):
         """Continue agent i's route through the lanelet graph so its goals can keep
