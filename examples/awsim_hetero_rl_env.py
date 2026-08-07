@@ -64,6 +64,10 @@ RENDER_TYPES = TYPES + ["parked"]
 PARKED_COLOR = (204, 0, 0)
 PARKED_LATERAL = 1.0      # m offset towards the near side (left-hand traffic)
 
+# How much it costs to be hit, by what was hit. A pedestrian struck by a car is not the
+# same event as two cars touching, and the reward said it was.
+COLLISION_WEIGHT = {"vehicle": 1.0, "motorcycle": 1.5, "cyclist": 2.0, "pedestrian": 3.0}
+
 DEFAULT_MIX = {"vehicle": 0.4, "motorcycle": 0.15, "cyclist": 0.15, "pedestrian": 0.3}
 PARTICIPANT_ENUM = {
     "vehicle": "Vehicle", "motorcycle": "VehicleMotorcycle",
@@ -147,6 +151,9 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self.type_onehot = torch.zeros(num_agents, len(TYPES), device=device)
         self.type_onehot[torch.arange(num_agents, device=device), self._type_idx_t] = 1.0
 
+        self._collision_vuln = torch.tensor(
+            [COLLISION_WEIGHT[TYPES[t]] for t in self.agent_type_idx],
+            dtype=torch.float32, device=device)
         self._build_spawn_pools()
         self._build_parking_spots()
         self.reset()
@@ -163,6 +170,9 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             if not bool(mask[i].any()):       # participant has no surface of its own
                 mask[i] = True
         return mask
+
+    def _collision_weight(self):
+        return self._collision_vuln
 
     def _signal_participant_mask(self, owners):
         """Each type is judged only against stop lines on lanelets it may use, so

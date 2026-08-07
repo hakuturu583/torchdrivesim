@@ -854,8 +854,13 @@ class AWSIMDrivingEnv:
     # "TODO: batch across agent dimension"), so at A agents it issues A x small
     # kernels per step and is launch-overhead bound. This is the same `discs`
     # metric computed for all agent pairs at once.
+    def _collision_weight(self):
+        """[A] multiplier for hitting each agent. One road-user type here, so uniform."""
+        return torch.ones(self.num_agents, device=self.device)
+
     def _collision(self, state):
-        """Per-agent collision loss, equivalent to `simulator.compute_collision()[0]`."""
+        """Per-agent collision loss, `simulator.compute_collision()[0]` weighted by what
+        was hit (see `_collision_weight`)."""
         A = self.num_agents
         size = self.simulator.get_agent_size()[0][..., :2]
         box = torch.nan_to_num(torch.cat([state[:, :2], size, state[:, 2:3]], dim=-1))
@@ -871,6 +876,11 @@ class AWSIMDrivingEnv:
         mask = self.simulator.get_present_mask()[0].to(overlap.dtype)
         overlap = torch.nan_to_num(overlap) * mask.unsqueeze(0)
         overlap = overlap - torch.diag_embed(overlap.diagonal())       # drop self-overlap
+        # what you hit matters: running into a pedestrian and clipping a kerb cost the
+        # same before, and 156 of the 782 contacts in an episode were a car reaching a
+        # pedestrian. Columns are weighted by the *other* agent's vulnerability, so the
+        # heavier party pays more for the same event.
+        overlap = overlap * self._collision_weight().unsqueeze(0)
         return overlap.sum(dim=-1) * mask
 
     def _steering_params(self):
@@ -989,6 +999,9 @@ class AWSIMDrivingEnv:
             state[i, 0], state[i, 1], state[i, 2], state[i, 3] = x, y, h, 0.0
             m[i] = True
             self._prev_sl_idx[i] = -1
+        # a teleport changes the overlap discontinuously; that jump is not the agent
+        # driving into anything, so the next step must not charge it
+        self._just_moved = self._just_moved | m
         self.simulator.set_state(state.unsqueeze(0), mask=m.unsqueeze(0))
         return True
 
@@ -1164,6 +1177,8 @@ class AWSIMDrivingEnv:
         self._goals_reached = torch.zeros(self.num_agents, device=self.device)
         self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._off_run = torch.zeros(self.num_agents, device=self.device)
+        self._prev_collision = torch.zeros(self.num_agents, device=self.device)
+        self._just_moved = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         if not hasattr(self, '_parked'):
             self._parked = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._lost_count = 0
@@ -1194,8 +1209,15 @@ class AWSIMDrivingEnv:
         progress = progress * (1.0 - offroad)      # no credit for shortcutting off-road
         redlight, wrongway, speeding, failtoyield = self._rule_violations(state)
         lane = self._lane_offset(state)
+        # Charge driving *into* a contact, not sitting in one. The level counts a single
+        # event for as many steps as the overlap lasts, so it is dominated by whoever is
+        # stuck - 36% of contacts have a stationary party, and pedestrians clumping held
+        # 1301 pair-steps against 81 onsets. The rise is the smooth analogue of an onset:
+        # it integrates to how deep the agent drove in, and backing out is free.
+        hit = (collision - self._prev_collision).clamp(min=0.0) * (~self._just_moved)
+        self._prev_collision, self._just_moved = collision, torch.zeros_like(self._just_moved)
         newly_reached = (dist < self.goal_radius) & (~was_reached)
-        reward = (self.w_progress * progress - self.w_collision * collision
+        reward = (self.w_progress * progress - self.w_collision * hit
                   - self.w_offroad * offroad + self.w_goal * newly_reached.float()
                   - self.w_redlight * redlight - self.w_wrongway * wrongway
                   - self.w_speeding * speeding            # see W_SPEEDING
@@ -1262,7 +1284,10 @@ class AWSIMDrivingEnv:
             'speeding': mean_active((self._excess_kmh > self.SPEED_TOLERANCE * 3.6).float()),
             'speed_excess': mean_active(self._excess_kmh),
             'failtoyield': mean_active(failtoyield),
+            # the level stays in the log so runs before the change remain comparable;
+            # `contact` is what the reward now charges
             'collision': mean_active(collision),
+            'contact': mean_active(hit),
             'offroad': mean_active(offroad),
             'lane': mean_active(lane),
             'active': active,
