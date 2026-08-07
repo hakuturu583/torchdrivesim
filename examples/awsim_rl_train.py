@@ -84,6 +84,7 @@ class PPOConfig:
     w_lanechange: float = 0.0        # crossing a dashed line onto a neighbouring lane
     w_solidcross: float = 0.0        # crossing a line the map says may not be crossed
     w_collision_level: float = 0.0   # kept alongside the rise; 0 reproduces hit300
+    max_steer_scale: float = 1.0     # scales every type's geometric steering limit
     lat_accel_max: float = 4.0       # m/s^2; the speed-dependent steering cap
     w_lane: float = 0.4         # lateral offset from the lane centre (see W_LANE)
     ttc_threshold: float = 3.0
@@ -206,7 +207,7 @@ def train(cfg: PPOConfig):
                   w_speeding=cfg.w_speeding, w_yield=cfg.w_yield,
                   w_proximity=cfg.w_proximity, ttc_threshold=cfg.ttc_threshold,
                   w_lane=cfg.w_lane, w_collision_level=cfg.w_collision_level,
-                  lat_accel_max=cfg.lat_accel_max,
+                  lat_accel_max=cfg.lat_accel_max, max_steer_scale=cfg.max_steer_scale,
                   w_lanechange=cfg.w_lanechange, w_solidcross=cfg.w_solidcross,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM

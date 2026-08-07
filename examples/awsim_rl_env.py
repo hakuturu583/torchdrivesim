@@ -211,7 +211,8 @@ class AWSIMDrivingEnv:
                  w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
                  w_proximity=None, ttc_threshold=None, w_lane=None,
                  w_collision_level=None, lat_accel_max=None,
-                 w_lanechange=None, w_solidcross=None):
+                 w_lanechange=None, w_solidcross=None, max_steer_scale=1.0):
+        self.max_steer_scale = max_steer_scale
         self.w_lanechange = self.W_LANECHANGE if w_lanechange is None else w_lanechange
         self.w_solidcross = self.W_SOLIDCROSS if w_solidcross is None else w_solidcross
         self.w_collision_level = (self.W_COLLISION_LEVEL if w_collision_level is None
@@ -953,7 +954,7 @@ class AWSIMDrivingEnv:
         used by `_limit_steering`. One type here, so all three are uniform."""
         A = self.num_agents
         return (torch.full((A,), self.lr, device=self.device),
-                torch.full((A,), self.MAX_STEER, device=self.device),
+                torch.full((A,), self.MAX_STEER * self.max_steer_scale, device=self.device),
                 torch.ones(A, dtype=torch.bool, device=self.device))
 
     def _limit_steering(self, action, state):

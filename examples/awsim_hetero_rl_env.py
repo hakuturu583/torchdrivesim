@@ -93,7 +93,8 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
                  w_proximity=None, ttc_threshold=None, w_lane=None,
                  w_collision_level=None, lat_accel_max=None,
-                 w_lanechange=None, w_solidcross=None):
+                 w_lanechange=None, w_solidcross=None, max_steer_scale=1.0):
+        self.max_steer_scale = max_steer_scale
         self.w_lanechange = self.W_LANECHANGE if w_lanechange is None else w_lanechange
         self.w_solidcross = self.W_SOLIDCROSS if w_solidcross is None else w_solidcross
         self.w_collision_level = (self.W_COLLISION_LEVEL if w_collision_level is None
@@ -599,7 +600,8 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         not a steering angle, so `_limit_steering` must leave it alone."""
         spec = [TYPE_SPEC[TYPES[t]] for t in self.agent_type_idx]
         lr = torch.tensor([s["lr"] for s in spec], dtype=torch.float32, device=self.device)
-        mx = torch.tensor([s["max_steer"] for s in spec], dtype=torch.float32, device=self.device)
+        mx = torch.tensor([s["max_steer"] * self.max_steer_scale for s in spec],
+                          dtype=torch.float32, device=self.device)
         wheeled = torch.tensor([s["model"] == 0 for s in spec], device=self.device)
         return lr, mx, wheeled
 

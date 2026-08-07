@@ -40,7 +40,8 @@ BASE = dict(
     w_redlight=0.5, w_wrongway=0.2, w_speeding=0.05, w_yield=0.4,
     w_proximity=0.1, ttc_threshold=3.0, w_lane=0.4,
     w_collision_level=0.0, lat_accel_max=4.0,
-    w_lanechange=0.0, w_solidcross=0.0, checkpoint_every=50,
+    w_lanechange=0.0, w_solidcross=0.0, max_steer_scale=1.0, seed=42,
+    checkpoint_every=50,
 )
 
 PLANS = {
@@ -64,6 +65,16 @@ PLANS = {
     # ...and the same, charging only what the map says is not allowed, to separate
     # "lane changes are being abused" from "illegal lane changes are being abused".
     "solidonly": dict(w_lanechange=0.0, w_solidcross=3.0),
+    # The reference again, seed only. Five single-variable plans have now landed within
+    # 0.089-0.097 of each other on contact rate and there is no replicate to say whether
+    # that band is a result or the noise floor. This run is the ruler.
+    "repeat": dict(seed=123),
+    # Two untested causes of the speed loss (goals 3.65 -> 2.47, vehicle speed/limit
+    # 0.73 -> 0.29). `steer` cleared the lateral-acceleration cap; these are what is
+    # left: the lane penalty itself, and the geometric steering limit, which took the
+    # car's minimum turn radius from 1.96 m to 6.6 m and was never varied.
+    "nolane": dict(w_lane=0.0),
+    "widesteer": dict(max_steer_scale=2.0),
 }
 
 DONE = re.compile(r"^\[done\] per-type (goals|v/limit)/agent?: (.*)$")
