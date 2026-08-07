@@ -193,6 +193,12 @@ class AWSIMDrivingEnv:
     # sitting on a centreline is collected just as well by an agent that has stopped.
     # The rise alone makes staying overlapped free once you are in, and the overlap
     # time went up 18% because of it. A small level term restores a reason to get out.
+    # Changing lane was free, and stepping sideways is the cheapest way out of a
+    # rear-end conflict. `w_lanechange` charges a legal change (a dashed line, which is
+    # normal driving and so should cost little); `w_solidcross` charges crossing a line
+    # the map says may not be crossed.
+    W_LANECHANGE = 0.0
+    W_SOLIDCROSS = 0.0
     W_COLLISION_LEVEL = 0.0
     W_LANE = 0.4
     LANE_TOLERANCE = 1.2             # m of lateral offset that costs nothing
@@ -204,7 +210,10 @@ class AWSIMDrivingEnv:
                  rolling_goals=None, goal_dist=None,
                  w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
                  w_proximity=None, ttc_threshold=None, w_lane=None,
-                 w_collision_level=None, lat_accel_max=None):
+                 w_collision_level=None, lat_accel_max=None,
+                 w_lanechange=None, w_solidcross=None):
+        self.w_lanechange = self.W_LANECHANGE if w_lanechange is None else w_lanechange
+        self.w_solidcross = self.W_SOLIDCROSS if w_solidcross is None else w_solidcross
         self.w_collision_level = (self.W_COLLISION_LEVEL if w_collision_level is None
                                   else w_collision_level)
         if lat_accel_max is not None:
@@ -367,6 +376,7 @@ class AWSIMDrivingEnv:
         self._pt_lanelet = torch.tensor([order[ll.id] for ll in lanelets], device=self.device)
         self._add_oncoming_turn_priority()
         self._build_downstream()
+        self._build_lateral()
 
     def _build_downstream(self):
         """[L, L] mask: lanelet j follows lanelet i within DOWNSTREAM_HOPS.
@@ -389,6 +399,53 @@ class AWSIMDrivingEnv:
         for _ in range(self.DOWNSTREAM_HOPS - 1):     # transitive closure, bounded
             reach = reach | (reach.float() @ adj.float() > 0)
         self._downstream = reach
+
+    def _build_lateral(self):
+        """[L, L] masks for stepping sideways onto a neighbouring lane.
+
+        Nothing charged a lane change before. `offroad` fires only off the drivable
+        surface, and both lanes are on it; `wrongway` needs more than 90 degrees of
+        heading error; and `_lane_offset` measures to the nearest centreline *of any
+        lane the participant may use*, so once the agent is over the line the offset
+        resets to zero. The cheapest way out of a rear-end conflict was therefore to
+        step sideways, and it was free - which is a plausible reading of why crossing
+        conflicts went from 25.5% to 39.7% of contacts once driving into one got
+        expensive.
+
+        lanelet2 already draws the distinction the map does: `left`/`right` is a
+        neighbour a lane change may legally reach (a dashed line - 285 of the 884
+        drivable lanelets have one), `adjacentLeft`/`adjacentRight` is a neighbour it
+        may not (a solid line - 201 more). The map backs this up with 486 solid and
+        254 dashed boundary linestrings.
+        """
+        order = self._lanelet_order
+        L = len(order)
+        legal = torch.zeros(L, L, dtype=torch.bool, device=self.device)
+        solid = torch.zeros(L, L, dtype=torch.bool, device=self.device)
+        rules = lanelet2.traffic_rules.create(Locations.Germany, Participants.Vehicle)
+        graph = lanelet2.routing.RoutingGraph(self.lanelet_map, rules)
+        for ll in self.lanelet_map.laneletLayer:
+            if ll.id not in order:
+                continue
+            i = order[ll.id]
+            for nb, table in ((graph.left(ll), legal), (graph.right(ll), legal),
+                              (graph.adjacentLeft(ll), solid),
+                              (graph.adjacentRight(ll), solid)):
+                if nb is not None and nb.id in order:
+                    table[i, order[nb.id]] = True
+        self._lane_legal, self._lane_solid = legal, solid & ~legal
+
+    def _lane_change(self, state):
+        """(legal, over-a-solid-line) indicators for stepping onto a neighbouring lane
+        this step. A teleport moves the agent between lanelets discontinuously, so the
+        step after one is exempt, as is the first step of an episode."""
+        lane = self._agent_lanelet(state)
+        prev = self._prev_lane
+        moved = (lane != prev) & self._lane_valid & (~self._just_moved)
+        legal = moved & self._lane_legal[prev, lane]
+        solid = moved & self._lane_solid[prev, lane]
+        self._prev_lane, self._lane_valid = lane, torch.ones_like(self._lane_valid)
+        return legal.float(), solid.float()
 
     def _add_oncoming_turn_priority(self):
         """Make right-turning lanelets give way to the oncoming traffic they cross.
@@ -1186,6 +1243,8 @@ class AWSIMDrivingEnv:
         self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._off_run = torch.zeros(self.num_agents, device=self.device)
         self._prev_collision = torch.zeros(self.num_agents, device=self.device)
+        self._prev_lane = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
+        self._lane_valid = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._just_moved = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         if not hasattr(self, '_parked'):
             self._parked = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
@@ -1217,6 +1276,7 @@ class AWSIMDrivingEnv:
         progress = progress * (1.0 - offroad)      # no credit for shortcutting off-road
         redlight, wrongway, speeding, failtoyield = self._rule_violations(state)
         lane = self._lane_offset(state)
+        chg_legal, chg_solid = self._lane_change(state)
         # Charge driving *into* a contact, not sitting in one. The level counts a single
         # event for as many steps as the overlap lasts, so it is dominated by whoever is
         # stuck - 36% of contacts have a stationary party, and pedestrians clumping held
@@ -1227,6 +1287,7 @@ class AWSIMDrivingEnv:
         newly_reached = (dist < self.goal_radius) & (~was_reached)
         reward = (self.w_progress * progress - self.w_collision * hit
                   - self.w_collision_level * collision
+                  - self.w_lanechange * chg_legal - self.w_solidcross * chg_solid
                   - self.w_offroad * offroad + self.w_goal * newly_reached.float()
                   - self.w_redlight * redlight - self.w_wrongway * wrongway
                   - self.w_speeding * speeding            # see W_SPEEDING
@@ -1299,6 +1360,8 @@ class AWSIMDrivingEnv:
             'contact': mean_active(hit),
             'offroad': mean_active(offroad),
             'lane': mean_active(lane),
+            'lanechange': mean_active(chg_legal),
+            'solidcross': mean_active(chg_solid),
             'active': active,
             # fixed-length episodes: the boundary is known without reading the device
             'episode_end': self._t >= self.max_steps,

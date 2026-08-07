@@ -20,7 +20,13 @@ import subprocess
 import time
 
 from prefect import flow, get_run_logger, task
+from prefect.concurrency.sync import concurrency
 from prefect.task_runners import ThreadPoolTaskRunner
+
+# One GPU. The limit is a *global* one so it holds across flow runs: submit a fourth
+# plan while three are training and Prefect queues it rather than thrashing the card.
+#   prefect gcl create gpu-train --limit 3
+GPU_SLOT = "gpu-train"
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAP = "nishishinjuku_autoware_map/lanelet2_map.osm"
@@ -33,7 +39,8 @@ BASE = dict(
     w_progress=0.1, w_goal=5.0, w_offroad=0.6, w_collision=6.0,
     w_redlight=0.5, w_wrongway=0.2, w_speeding=0.05, w_yield=0.4,
     w_proximity=0.1, ttc_threshold=3.0, w_lane=0.4,
-    w_collision_level=0.0, lat_accel_max=4.0, checkpoint_every=50,
+    w_collision_level=0.0, lat_accel_max=4.0,
+    w_lanechange=0.0, w_solidcross=0.0, checkpoint_every=50,
 )
 
 PLANS = {
@@ -48,6 +55,15 @@ PLANS = {
     # term costs ~0.013 per step. The 0.1-vs-0.3 A/B that chose 0.1 predates the
     # same-lane bend fix, the lane penalty and the lookahead.
     "prox": dict(w_proximity=0.3),
+    # Changing lane was free: `offroad` needs the drivable surface, `wrongway` needs 90
+    # degrees, and `_lane_offset` measures to the nearest lane of any kind, so the offset
+    # resets the moment the agent is over the line. Stepping sideways was the cheapest
+    # escape from a rear-end conflict, and crossing conflicts went 25.5% -> 39.7% of
+    # contacts once driving into one got expensive.
+    "lanechg": dict(w_lanechange=0.5, w_solidcross=3.0),
+    # ...and the same, charging only what the map says is not allowed, to separate
+    # "lane changes are being abused" from "illegal lane changes are being abused".
+    "solidonly": dict(w_lanechange=0.0, w_solidcross=3.0),
 }
 
 DONE = re.compile(r"^\[done\] per-type (goals|v/limit)/agent?: (.*)$")
@@ -69,9 +85,11 @@ def train(name: str, overrides: dict, tag: str) -> dict:
     env = {k: v for k, v in os.environ.items() if k != "WANDB_API_KEY"}
     logger.info("start %s: %s", name, " ".join(f"{k}={overrides[k]}" for k in overrides))
     t0 = time.time()
-    with open(log_path, "w") as log:
-        rc = subprocess.call(["uv", "run", "python", "examples/awsim_rl_train.py"] + args,
-                             cwd=REPO, stdout=log, stderr=subprocess.STDOUT, env=env)
+    with concurrency(GPU_SLOT, occupy=1):
+        logger.info("%s got a GPU slot", name)
+        with open(log_path, "w") as log:
+            rc = subprocess.call(["uv", "run", "python", "examples/awsim_rl_train.py"] + args,
+                                 cwd=REPO, stdout=log, stderr=subprocess.STDOUT, env=env)
     mins = (time.time() - t0) / 60
     tail, per_type = [], {}
     for line in open(log_path, errors="ignore"):

@@ -81,6 +81,8 @@ class PPOConfig:
     w_yield: float = 0.5
     n_parked: int = 16         # stationary cars on straight lanelets (hetero env only)
     w_proximity: float = 0.3
+    w_lanechange: float = 0.0        # crossing a dashed line onto a neighbouring lane
+    w_solidcross: float = 0.0        # crossing a line the map says may not be crossed
     w_collision_level: float = 0.0   # kept alongside the rise; 0 reproduces hit300
     lat_accel_max: float = 4.0       # m/s^2; the speed-dependent steering cap
     w_lane: float = 0.4         # lateral offset from the lane centre (see W_LANE)
@@ -205,6 +207,7 @@ def train(cfg: PPOConfig):
                   w_proximity=cfg.w_proximity, ttc_threshold=cfg.ttc_threshold,
                   w_lane=cfg.w_lane, w_collision_level=cfg.w_collision_level,
                   lat_accel_max=cfg.lat_accel_max,
+                  w_lanechange=cfg.w_lanechange, w_solidcross=cfg.w_solidcross,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
@@ -238,7 +241,7 @@ def train(cfg: PPOConfig):
             f = min(1.0, cfg.penalty_warmup_start + (1 - cfg.penalty_warmup_start)
                     * update / cfg.penalty_warmup)
             for k in ('offroad', 'collision', 'redlight', 'wrongway', 'speeding', 'yield',
-                      'proximity', 'lane', 'collision_level'):
+                      'proximity', 'lane', 'collision_level', 'lanechange', 'solidcross'):
                 setattr(env, f'w_{k}', getattr(cfg, f'w_{k}') * f)
         # `info` is a snapshot of the step it came from: `reached` accumulates over an
         # episode and resets with it, so reading it off the last rollout step samples a
@@ -248,7 +251,7 @@ def train(cfg: PPOConfig):
         # infraction rates are averaged over the whole rollout.
         ep_reached, ep_reached_type, ep_goals, ep_lost = [], {}, [], []
         step_speed = []
-        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': []}
+        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': [], 'lanechange': [], 'solidcross': []}
 
         for t in range(cfg.rollout_steps):
             with torch.no_grad():
@@ -331,7 +334,8 @@ def train(cfg: PPOConfig):
               f"v/lim {mean_speed:.2f} off {mean_off:.2f} lost {mean_lost:4.0f} red {mean_rule['redlight']:.2f} "
               f"prox {mean_rule['proximity']:.3f} wrong {mean_rule['wrongway']:.2f} spd {mean_rule['speeding']:.2f}"
               f"/{mean_rule['speed_excess']:.2f} yld {mean_rule['failtoyield']:.3f} "
-              f"lane {mean_rule['lane']:.3f} hit {mean_rule['contact']:.4f} | "
+              f"lane {mean_rule['lane']:.3f} hit {mean_rule['contact']:.4f} "
+              f"chg {mean_rule['lanechange']:.4f}/{mean_rule['solidcross']:.4f} | "
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
             torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))
