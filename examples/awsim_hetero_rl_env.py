@@ -34,7 +34,7 @@ from torchdrivesim.lanelet2 import load_lanelet_map
 import lanelet2
 from lanelet2.traffic_rules import Locations, Participants
 
-from awsim_rl_env import AWSIMDrivingEnv
+from awsim_rl_env import AWSIMDrivingEnv, SteeringLimitedBicycle
 from awsim_lanelet2_traffic import (
     map_latlon_origin, build_driving_surface_mesh, build_route, mesh_camera,
     polyline_cumlen, point_at_arclen,
@@ -45,11 +45,16 @@ from awsim_lanelet2_traffic import (
 # spawn/route on (via traffic_rules.canPass) and which routing graph is used,
 # so Autoware participant tags + subtypes are honoured directly.
 TYPES = ["vehicle", "motorcycle", "cyclist", "pedestrian"]
+# `max_steer` is the slip angle one unit of steering action buys, in radians. It has to
+# be per type: the heading rate is v / lr * sin(beta), so the single library-default
+# pi/2 gave a motorcycle (lr = 0.8 m) three times a car's turn rate for the same command
+# and it learned to spin. The speed-dependent cap in AWSIMDrivingEnv.LAT_ACCEL_MAX sits
+# on top of this one; these are the geometric limits, roughly the steering lock of each.
 TYPE_SPEC = {
-    "vehicle":    dict(model=0, size=(4.97, 2.04), lr=1.96, vmax=14.0, participant="vehicle",    goal_dist=150.0, color=(32, 74, 135)),
-    "motorcycle": dict(model=0, size=(2.20, 0.90), lr=0.80, vmax=18.0, participant="motorcycle", goal_dist=150.0, color=(230, 90, 20)),
-    "cyclist":    dict(model=0, size=(1.80, 0.70), lr=0.60, vmax=6.0,  participant="bicycle",     goal_dist=60.0, color=(24, 104, 225)),
-    "pedestrian": dict(model=1, size=(0.70, 0.70), lr=0.50, vmax=2.0,  participant="pedestrian",  goal_dist=20.0, color=(173, 127, 168)),
+    "vehicle":    dict(model=0, size=(4.97, 2.04), lr=1.96, vmax=14.0, max_steer=0.30, participant="vehicle",    goal_dist=150.0, color=(32, 74, 135)),
+    "motorcycle": dict(model=0, size=(2.20, 0.90), lr=0.80, vmax=18.0, max_steer=0.35, participant="motorcycle", goal_dist=150.0, color=(230, 90, 20)),
+    "cyclist":    dict(model=0, size=(1.80, 0.70), lr=0.60, vmax=6.0,  max_steer=0.45, participant="bicycle",     goal_dist=60.0, color=(24, 104, 225)),
+    "pedestrian": dict(model=1, size=(0.70, 0.70), lr=0.50, vmax=2.0,  max_steer=1.00, participant="pedestrian",  goal_dist=20.0, color=(173, 127, 168)),
 }
 # Parked cars are rendered as a fifth category so they can be picked out in a video, but
 # the policy only ever sees the four TYPES: in the observation a parked car is a vehicle
@@ -421,12 +426,23 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self._route_end_ll[i] = end
         return True
 
+    def _steering_params(self):
+        """Per-agent rear-axle distance, steering limit, and which agents are on the
+        bicycle model at all - the pedestrian model's second action is a sideways step,
+        not a steering angle, so `_limit_steering` must leave it alone."""
+        spec = [TYPE_SPEC[TYPES[t]] for t in self.agent_type_idx]
+        lr = torch.tensor([s["lr"] for s in spec], dtype=torch.float32, device=self.device)
+        mx = torch.tensor([s["max_steer"] for s in spec], dtype=torch.float32, device=self.device)
+        wheeled = torch.tensor([s["model"] == 0 for s in spec], device=self.device)
+        return lr, mx, wheeled
+
     def _build_simulator(self):
         A = self.num_agents
         assign = self.model_assignments
         wheeled, ped = (assign[0] == 0), (assign[0] == 1)
-        bike = KinematicBicycle(dt=self.dt)
+        bike = SteeringLimitedBicycle(dt=self.dt)
         bike.set_params(lr=self.lr_all[wheeled].clone())
+        bike.set_steering_limit(self._steering_params()[1][wheeled].clone())
         bike.set_state(self._init_state[0, wheeled].clone())
         # OrientedKinematicModel, not SimpleKinematicModel: the latter's action is the
         # world-frame state gradient, but observations are purely ego-frame (the agent's

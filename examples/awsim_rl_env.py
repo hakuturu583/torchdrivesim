@@ -32,6 +32,20 @@ import lanelet2
 from lanelet2.traffic_rules import Locations, Participants
 
 
+class SteeringLimitedBicycle(KinematicBicycle):
+    """`KinematicBicycle` whose steering limit may differ per agent.
+
+    The library normalises steering by one scalar `max_steering`, so a mixed scene has
+    to give a bicycle and a lorry the same slip angle for the same action. Only the
+    normalisation is per-agent here; the dynamics are the library's unchanged.
+    """
+
+    def set_steering_limit(self, max_steering):
+        """`max_steering`: [A] tensor of radians, one per agent of this model."""
+        accel = torch.full_like(max_steering, float(self.max_acceleration))
+        self._normalization_factor = torch.stack([accel, max_steering], dim=-1)
+
+
 class AWSIMDrivingEnv:
     """Vectorised (num_agents parallel streams) driving env on one AWSIM map.
 
@@ -103,6 +117,22 @@ class AWSIMDrivingEnv:
     RSS_BRAKE = 5.0                  # m/s^2 braking, matching KinematicBicycle
     CORRIDOR_HALF_WIDTH = 6.0        # m; a loose sanity bound, not the lane test itself
     DOWNSTREAM_HOPS = 3              # lanelets ahead still counted as the same road
+
+    # Steering limits. `KinematicBicycle` normalises steering by a single `max_steering`
+    # that defaults to pi/2, so one unit of action was a *90 degree* slip angle for every
+    # road user, and the heading rate `psi_dot = v / lr * sin(beta)` then scales with
+    # 1 / lr - the shortest wheelbase spins fastest for the same command. Measured on the
+    # trained policy, motorcycles (lr = 0.8 m) averaged 515 deg/s of heading change, 51
+    # degrees per step, with the steering pinned to the rail 8.7% of the time: a top, not
+    # a vehicle, and it still scored second best on goals. Three limits, in order:
+    #   1. MAX_STEER    - the geometric limit the action range is normalised to.
+    #   2. LAT_ACCEL_MAX - sin(beta) <= a_lat * lr / v^2, since a_lat = v^2 / lr * sin(beta).
+    #      This is what stops the spinning: it is speed-dependent, so a tight turn is
+    #      only available after slowing down, exactly as on a real road.
+    #   3. STEER_RATE_MAX - how fast the steering itself may move between steps.
+    MAX_STEER = 0.30                 # rad (17 deg) of slip angle at the geometric centre
+    LAT_ACCEL_MAX = 4.0              # m/s^2 of lateral acceleration
+    STEER_RATE_MAX = 2.0             # rad/s, i.e. 0.2 rad of change per 0.1 s step
 
     # Rolling goals: instead of parking an agent at its single goal, the next goal is
     # placed GOAL_DIST further along the same route, and the route is extended through
@@ -725,10 +755,41 @@ class AWSIMDrivingEnv:
         overlap = overlap - torch.diag_embed(overlap.diagonal())       # drop self-overlap
         return overlap.sum(dim=-1) * mask
 
+    def _steering_params(self):
+        """Per-agent rear-axle distance, steering limit and 'is a bicycle model' mask,
+        used by `_limit_steering`. One type here, so all three are uniform."""
+        A = self.num_agents
+        return (torch.full((A,), self.lr, device=self.device),
+                torch.full((A,), self.MAX_STEER, device=self.device),
+                torch.ones(A, dtype=torch.bool, device=self.device))
+
+    def _limit_steering(self, action, state):
+        """Hold the steering command to what the vehicle could actually do.
+
+        Acts on the command rather than on the state afterwards, so the position
+        integration never sees a slip angle the tyres could not hold. See MAX_STEER /
+        LAT_ACCEL_MAX / STEER_RATE_MAX for why each of the three limits is here.
+        """
+        lr, steer_max, wheeled = self._steer_lr, self._steer_max, self._steer_wheeled
+        beta = action[:, 1] * steer_max                             # command, radians
+        # a_lat = v^2 / lr * sin(beta); solve for the largest beta that stays under it
+        v2 = state[:, 3].pow(2).clamp(min=1e-6)
+        sin_cap = (self.LAT_ACCEL_MAX * lr / v2).clamp(max=1.0)
+        cap = torch.minimum(torch.asin(sin_cap), steer_max)
+        beta = torch.max(torch.min(beta, cap), -cap)
+        # and it may only move so fast from where it was
+        d = self.STEER_RATE_MAX * self.dt
+        beta = torch.max(torch.min(beta, self._prev_steer + d), self._prev_steer - d)
+        self._prev_steer = torch.where(wheeled, beta, self._prev_steer)
+        out = action.clone()
+        out[:, 1] = torch.where(wheeled, beta / steer_max, action[:, 1])
+        return out
+
     def _build_simulator(self):
         A = self.num_agents
-        kin = KinematicBicycle(dt=self.dt)
+        kin = SteeringLimitedBicycle(dt=self.dt)
         kin.set_params(lr=torch.full((1, A), self.lr, device=self.device))
+        kin.set_steering_limit(self._steering_params()[1])
         kin.set_state(self._init_state.clone())
         # The action `_normalization_factor` is built on CPU in the constructor.
         kin = kin.to(self.device)
@@ -953,8 +1014,10 @@ class AWSIMDrivingEnv:
     def reset(self):
         self._prepare_reset()
         self._reset_route_state()
+        self._steer_lr, self._steer_max, self._steer_wheeled = self._steering_params()
         self._build_simulator()
         self._t = 0
+        self._prev_steer = torch.zeros(self.num_agents, device=self.device)
         self._prev_action = torch.zeros(self.num_agents, self.ACT_DIM, device=self.device)
         self._reached = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._goals_reached = torch.zeros(self.num_agents, device=self.device)
@@ -973,7 +1036,7 @@ class AWSIMDrivingEnv:
     def step(self, action):
         action = torch.as_tensor(action, dtype=torch.float32, device=self.device).clamp(-1, 1)
         was_reached = self._reached.clone()          # agents that already finished before this step
-        action = action.clone()
+        action = self._limit_steering(action, self._state())
         # parked cars never act: they are scenery the policy has to drive around, and they
         # are excluded from training so their (meaningless) transitions carry no gradient
         action[was_reached | self._parked] = 0.0
