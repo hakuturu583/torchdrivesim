@@ -68,10 +68,13 @@ class AWSIMDrivingEnv:
     # 8 nearest slots were filled by close agents and the distant one still never appeared
     # - so MAX_PARTNERS goes up with it.
     VIEW_RADIUS = 60.0        # metres; neighbours beyond this are not observed
-    MAX_ROAD = 10             # K nearest road-graph points observed
+    MAX_ROAD = 10             # forward distance bands of road-graph points observed
     ROAD_FEATURES = 4         # rel_x, rel_y, rel_dir_cos, rel_dir_sin
-    ROAD_RADIUS = 30.0        # metres; road points beyond this are not observed
-    ROAD_POINT_CAP = 2000     # subsample the lane-centreline point cloud to this many
+    ROAD_RADIUS = 50.0        # metres of road ahead described, one point per band
+    ROAD_BEHIND = 5.0         # the first band starts here, so the point underfoot is seen
+    # Banding needs a cloud finer than the bands: at the old 2000 points the spacing was
+    # ~21 m over 41.7 km of lane, so most 5.5 m bands would have been empty.
+    ROAD_POINT_CAP = 8000     # subsample the lane-centreline point cloud to this many
                               # (observation only - rules use the dense table below)
     OBS_DIM = EGO_DIM + MAX_PARTNERS * PARTNER_FEATURES + MAX_ROAD * ROAD_FEATURES
     NUM_TYPES = 1             # single agent type -> single policy head
@@ -181,12 +184,24 @@ class AWSIMDrivingEnv:
     # count a real margin, and report the magnitude separately.
     SPEEDING_TOLERANCE = 0.05
 
+    # Lane keeping. `offroad` only fires once the body has already left the drivable
+    # surface, which is a late and sparse signal: 73% of the off-road steps measured on
+    # the trained policy happened on straight lanelets, not at the junctions where
+    # cornering is hard, so agents were drifting out of lane with nothing pushing back
+    # until they were already out. This charges lateral offset from the lane centre
+    # before that, and it is a penalty rather than a bonus on purpose - a bonus for
+    # sitting on a centreline is collected just as well by an agent that has stopped.
+    W_LANE = 0.4
+    LANE_TOLERANCE = 1.2             # m of lateral offset that costs nothing
+    LANE_SCALE = 1.5                 # m over which the penalty ramps to its full value
+
     def __init__(self, map_path, num_agents=8, max_steps=80, dt=0.1, device='cpu',
                  goal_radius=3.0, render_fov=None, render_res=512, seed=0,
                  w_progress=None, w_goal=None, w_offroad=None, w_collision=None,
                  rolling_goals=None, goal_dist=None,
                  w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
-                 w_proximity=None, ttc_threshold=None):
+                 w_proximity=None, ttc_threshold=None, w_lane=None):
+        self.w_lane = self.W_LANE if w_lane is None else w_lane
         self.w_proximity = self.W_PROXIMITY if w_proximity is None else w_proximity
         if ttc_threshold is not None:
             self.TTC_THRESHOLD = ttc_threshold
@@ -695,6 +710,20 @@ class AWSIMDrivingEnv:
         same = lane.unsqueeze(0) == lane.unsqueeze(1)
         return same | self._downstream[lane.unsqueeze(1), lane.unsqueeze(0)]
 
+    def _lane_offset(self, state):
+        """How far each agent has strayed from the centre of a lane it may use, as 0 at
+        the tolerance and 1 at LANE_SCALE beyond it. See W_LANE.
+
+        The rule table is dense (unsubsampled), so the distance to its nearest point is
+        the lateral offset to within its own spacing. It is masked per participant, so a
+        pedestrian is measured against the crosswalk it is on, not the road underneath.
+        The agent can see this: the road block gives it the same centreline points in
+        its own frame.
+        """
+        near = self._nearest_rule_point(state)
+        lateral = torch.linalg.norm(state[:, :2] - self._rule_xy[near], dim=-1)
+        return ((lateral - self.LANE_TOLERANCE) / self.LANE_SCALE).clamp(0.0, 1.0)
+
     def _speed_limit(self, near):
         """The limit each agent is judged against at lane point `near`. One road-user
         type here, so it is simply the lane's own limit."""
@@ -1057,29 +1086,52 @@ class AWSIMDrivingEnv:
         return out.reshape(A, -1)
 
     def _road_block(self, state):
-        """GPUDrive-style road-graph observation: for each agent, the K nearest
-        lane-centreline points within ROAD_RADIUS, in the ego frame, zero-padded.
-        Returns [A, MAX_ROAD * ROAD_FEATURES]."""
+        """Road-graph observation: one lane-centreline point per forward distance band,
+        in the ego frame, zero-padded. Returns [A, MAX_ROAD * ROAD_FEATURES].
+
+        GPUDrive takes the K nearest points, which was fine while the point cloud was
+        coarse but gives no preview once it is dense - the K nearest are all within a
+        few metres. Measured on the trained policy, the road block reached a median of
+        15 m ahead, 1.5 s at 10 m/s, while slowing for a 9.4 m junction radius under the
+        lateral-acceleration limit needs 2-3 s of warning. Banding the points by
+        distance ahead guarantees the preview instead of hoping the sampling provides
+        it: the same ten slots now describe the road from 5 m behind to ROAD_RADIUS
+        ahead, one point per band, nearest within the band.
+        """
         A = state.shape[0]
         K = self.MAX_ROAD
         out = torch.zeros(A, K, self.ROAD_FEATURES, device=self.device)
         M = self._road_xy.shape[0]
-        k = min(K, M)
-        if k > 0:
-            psi = state[:, 2]
-            dx = self._road_xy[:, 0][None, :] - state[:, 0][:, None]   # [A, M]
-            dy = self._road_xy[:, 1][None, :] - state[:, 1][:, None]
-            dist2 = dx * dx + dy * dy
-            nd, nidx = torch.topk(dist2, k, dim=1, largest=False)      # [A, k]
-            valid = nd < self.ROAD_RADIUS ** 2
-            c, s = torch.cos(psi)[:, None], torch.sin(psi)[:, None]
-            gdx = torch.gather(dx, 1, nidx); gdy = torch.gather(dy, 1, nidx)
-            rel_x = (c * gdx + s * gdy) / self.ROAD_RADIUS
-            rel_y = (-s * gdx + c * gdy) / self.ROAD_RADIUS
-            rel_dir = self._road_dir[nidx] - psi[:, None]
-            feat = torch.stack([rel_x, rel_y, torch.cos(rel_dir), torch.sin(rel_dir)], dim=-1)
-            out[:, :k, :] = feat * valid[..., None]
-        return out.reshape(A, -1)
+        if M == 0:
+            return out.reshape(A, -1)
+        psi = state[:, 2]
+        dx = self._road_xy[:, 0][None, :] - state[:, 0][:, None]       # [A, M]
+        dy = self._road_xy[:, 1][None, :] - state[:, 1][:, None]
+        c, s = torch.cos(psi)[:, None], torch.sin(psi)[:, None]
+        fwd = c * dx + s * dy                                          # ahead of the agent
+        lat = -s * dx + c * dy
+        dist2 = dx * dx + dy * dy
+        # One scatter over all points rather than a masked min per band: looping the
+        # bands costs K passes over [A, M] and, at the density banding needs, that was
+        # 28 of the step's 43 ms. The distance and the point index are packed into one
+        # integer so a single amin returns both.
+        width = (self.ROAD_RADIUS + self.ROAD_BEHIND) / K
+        bid = ((fwd + self.ROAD_BEHIND) / width).floor().long()
+        keep = (bid >= 0) & (bid < K) & (dist2 < self.ROAD_RADIUS ** 2)
+        code = (dist2 * 100).long() * M + torch.arange(M, device=self.device)[None, :]
+        SENTINEL = torch.iinfo(torch.int64).max
+        code = torch.where(keep, code, torch.full_like(code, SENTINEL))
+        slot = torch.where(keep, bid, torch.full_like(bid, K))
+        best = torch.full((A, K + 1), SENTINEL, dtype=torch.int64, device=self.device)
+        best.scatter_reduce_(1, slot, code, reduce='amin', include_self=True)
+        best = best[:, :K]                                             # [A, K]
+        has = best != SENTINEL
+        idx = (best % M).clamp(min=0)                                  # winning point per band
+        rel_dir = self._road_dir[idx] - psi[:, None]
+        out = torch.stack([torch.gather(fwd, 1, idx) / self.ROAD_RADIUS,
+                           torch.gather(lat, 1, idx) / self.ROAD_RADIUS,
+                           torch.cos(rel_dir), torch.sin(rel_dir)], dim=-1)
+        return (out * has[..., None]).reshape(A, -1)
 
     # Hooks so subclasses (e.g. the heterogeneous env) can extend reset/step
     # without duplicating their bodies.
@@ -1133,12 +1185,14 @@ class AWSIMDrivingEnv:
         proximity = self._proximity(state)
         progress = progress * (1.0 - offroad)      # no credit for shortcutting off-road
         redlight, wrongway, speeding, failtoyield = self._rule_violations(state)
+        lane = self._lane_offset(state)
         newly_reached = (dist < self.goal_radius) & (~was_reached)
         reward = (self.w_progress * progress - self.w_collision * collision
                   - self.w_offroad * offroad + self.w_goal * newly_reached.float()
                   - self.w_redlight * redlight - self.w_wrongway * wrongway
                   - self.w_speeding * speeding            # see W_SPEEDING
-                  - self.w_yield * failtoyield - self.w_proximity * proximity)
+                  - self.w_yield * failtoyield - self.w_proximity * proximity
+                  - self.w_lane * lane)
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
         # a sustained excursion means the agent is lost, not clipping a kerb
@@ -1202,6 +1256,7 @@ class AWSIMDrivingEnv:
             'failtoyield': mean_active(failtoyield),
             'collision': mean_active(collision),
             'offroad': mean_active(offroad),
+            'lane': mean_active(lane),
             'active': active,
             # fixed-length episodes: the boundary is known without reading the device
             'episode_end': self._t >= self.max_steps,
