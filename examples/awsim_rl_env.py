@@ -714,14 +714,22 @@ class AWSIMDrivingEnv:
         """How far each agent has strayed from the centre of a lane it may use, as 0 at
         the tolerance and 1 at LANE_SCALE beyond it. See W_LANE.
 
-        The rule table is dense (unsubsampled), so the distance to its nearest point is
-        the lateral offset to within its own spacing. It is masked per participant, so a
-        pedestrian is measured against the crosswalk it is on, not the road underneath.
-        The agent can see this: the road block gives it the same centreline points in
-        its own frame.
+        Measured perpendicular to the lane, not as the distance to the nearest table
+        point. The table runs at 1.38 m spacing, so the nearest point sits up to 0.7 m
+        along the lane as well as across it, and that longitudinal error adds in
+        quadrature: a median 0.95 m against a true 0.45 m of offset. Charging it made
+        two thirds of the penalty an artefact of the sampling - agents paid about
+        0.077 per step against a forward incentive of roughly 0.10, so driving slower to
+        wander less was the rational response, and speed/limit fell from 0.65 to 0.53.
+
+        Masked per participant, so a pedestrian is measured against the crosswalk it is
+        on, not the road underneath. The agent can see what it is charged for: the road
+        block gives it the same centreline points in its own frame.
         """
         near = self._nearest_rule_point(state)
-        lateral = torch.linalg.norm(state[:, :2] - self._rule_xy[near], dim=-1)
+        rel = state[:, :2] - self._rule_xy[near]
+        d = self._rule_dir[near]
+        lateral = (-torch.sin(d) * rel[:, 0] + torch.cos(d) * rel[:, 1]).abs()
         return ((lateral - self.LANE_TOLERANCE) / self.LANE_SCALE).clamp(0.0, 1.0)
 
     def _speed_limit(self, near):
