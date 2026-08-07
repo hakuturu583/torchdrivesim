@@ -84,6 +84,8 @@ class PPOConfig:
     w_lanechange: float = 0.0        # crossing a dashed line onto a neighbouring lane
     w_solidcross: float = 0.0        # crossing a line the map says may not be crossed
     w_collision_level: float = 0.0   # kept alongside the rise; 0 reproduces hit300
+    value_norm: bool = False         # standardise the value targets (MAPPO)
+    penalty_scale: float = 1.0       # one dial on every penalty, see below
     max_steer_scale: float = 1.0     # scales every type's geometric steering limit
     lat_accel_max: float = 4.0       # m/s^2; the speed-dependent steering cap
     w_lane: float = 0.4         # lateral offset from the lane centre (see W_LANE)
@@ -174,6 +176,38 @@ class ActorCritic(nn.Module):
         return logp, entropy, value
 
 
+class ValueNorm:
+    """Running standardisation of the value targets.
+
+    MAPPO (arXiv:2103.01955) finds this the most influential of its five factors and
+    reports it "never hurts training". It matters more here than in a single-task
+    setting because the return is assembled from thirteen terms on wildly different
+    scales - a +5 goal spike against continuous penalties of 0.02 - so the regression
+    target's scale moves as the policy changes which terms it collects. The critic
+    predicts in normalised space; GAE needs real units, so values are denormalised on
+    the way out and targets normalised on the way in.
+    """
+
+    def __init__(self, device):
+        self.mean = torch.zeros((), device=device)
+        self.var = torch.ones((), device=device)
+        self.count = 1e-4
+
+    def update(self, x):
+        bm, bv, bc = x.mean(), x.var(unbiased=False), x.numel()
+        delta, tot = bm - self.mean, self.count + bc
+        self.mean = self.mean + delta * bc / tot
+        self.var = ((self.var * self.count + bv * bc
+                     + delta.pow(2) * self.count * bc / tot) / tot)
+        self.count = tot
+
+    def normalize(self, x):
+        return (x - self.mean) / (self.var.sqrt() + 1e-8)
+
+    def denormalize(self, x):
+        return x * (self.var.sqrt() + 1e-8) + self.mean
+
+
 def compute_gae(rewards, values, dones, last_value, gamma, lam):
     T, A = rewards.shape
     adv = torch.zeros(T, A, device=rewards.device)
@@ -188,7 +222,20 @@ def compute_gae(rewards, values, dones, last_value, gamma, lam):
     return adv, returns
 
 
+PENALTIES = ('offroad', 'collision', 'collision_level', 'redlight', 'wrongway',
+             'speeding', 'yield', 'proximity', 'lane', 'lanechange', 'solidcross')
+
+
 def train(cfg: PPOConfig):
+    if cfg.penalty_scale != 1.0:
+        # Measured on the trained policy, the penalties come to 0.111 per step against
+        # 0.095 of progress and goal: driving is negative-expected-value, and the policy
+        # answers by driving as little as it can. Removing the lane term alone (18.9% of
+        # the penalty budget) took speed/limit 0.52 -> 0.58 and the return positive, so
+        # this is one dial on all of them rather than another hunt for the guilty term.
+        for k in PENALTIES:
+            setattr(cfg, f'w_{k}', getattr(cfg, f'w_{k}') * cfg.penalty_scale)
+        print(f"[cfg] penalties scaled by {cfg.penalty_scale}", flush=True)
     if cfg.smoke_test:
         cfg.updates, cfg.rollout_steps = 5, 128
         cfg.num_agents = 12 if cfg.hetero else 6
@@ -215,6 +262,7 @@ def train(cfg: PPOConfig):
                       env.MAX_ROAD, env.ROAD_FEATURES, ad, cfg.hidden,
                       num_types=env.NUM_TYPES, type_slice=env.TYPE_ONEHOT_SLICE).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, eps=1e-8)
+    vnorm = ValueNorm(dev) if cfg.value_norm else None
     if cfg.resume:
         net.load_state_dict(torch.load(cfg.resume, map_location=dev))
         print(f"[resume] loaded policy from {cfg.resume}")
@@ -258,7 +306,8 @@ def train(cfg: PPOConfig):
             with torch.no_grad():
                 action, logp, value = net.act(obs)
             next_obs, reward, done, info = env.step(action)
-            b_obs[t], b_act[t], b_logp[t], b_val[t] = obs, action, logp, value
+            b_obs[t], b_act[t], b_logp[t] = obs, action, logp
+            b_val[t] = vnorm.denormalize(value) if vnorm else value
             b_rew[t], b_done[t] = reward, done.float()
             b_active[t] = info['active'].float()
             ep_return += reward
@@ -281,7 +330,13 @@ def train(cfg: PPOConfig):
 
         with torch.no_grad():
             last_value = net(obs)[2]
+            if vnorm:
+                last_value = vnorm.denormalize(last_value)
         adv, returns = compute_gae(b_rew, b_val, b_done, last_value, cfg.gamma, cfg.gae_lambda)
+        if vnorm:
+            # update on this batch's targets, then regress against them standardised
+            vnorm.update(returns)
+            returns = vnorm.normalize(returns)
 
         f_obs = b_obs.reshape(-1, od)
         f_act = b_act.reshape(-1, ad)
