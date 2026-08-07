@@ -436,7 +436,7 @@ class AWSIMDrivingEnv:
         approach groups in antiphase. That is enough to require stopping and to make
         crossing traffic mutually exclusive, but it is not Autoware's real signal logic.
         """
-        seen, sig = {}, []
+        seen, sig, owners = {}, [], []
         for ll in self.lanelet_map.laneletLayer:
             for r in ll.regulatoryElements:
                 if 'subtype' not in r.attributes or r.attributes['subtype'] != 'traffic_light':
@@ -459,11 +459,16 @@ class AWSIMDrivingEnv:
                 a, b = np.asarray(cl[-2]), np.asarray(cl[-1])
                 seen[r.id] = len(sig)
                 sig.append((mid[0], mid[1], float(np.arctan2(b[1] - a[1], b[0] - a[0]))))
+                owners.append(ll)
+        n_vehicle = len(sig)
+        sig, owners = self._add_crosswalk_signals(sig, owners)
         if not sig:
             self._sl_xy = torch.zeros(0, 2, device=self.device)
             self._sl_dir = torch.zeros(0, device=self.device)
             self._sl_group = torch.zeros(0, dtype=torch.long, device=self.device)
             self._sl_offset = torch.zeros(0, dtype=torch.long, device=self.device)
+            self._sl_ped = torch.zeros(0, dtype=torch.bool, device=self.device)
+            self._sl_allowed = torch.zeros(self.NUM_TYPES, 0, dtype=torch.bool, device=self.device)
             return
         sig = np.asarray(sig, dtype=np.float64)
 
@@ -488,10 +493,78 @@ class AWSIMDrivingEnv:
             ref = sig[members[0], 2]
             group[members] = (np.abs(np.cos(sig[members, 2] - ref)) < 0.5).astype(np.int64)
             offset[members] = int(self._rng.integers(period))   # desynchronise junctions
+
+        # A crossing takes the opposite phase to the traffic it actually cuts across,
+        # read off those approaches rather than inferred from its own heading: at a
+        # skewed junction the parallel/perpendicular split lands on the wrong side of
+        # its 45-degree boundary, and 26 of 139 crossings came out in phase with the
+        # cars they cross - a green light walking into moving traffic.
+        n_vehicle = min(n_vehicle, len(sig))
+        veh = np.arange(n_vehicle)
+        for i in range(n_vehicle, len(sig)):
+            # by distance, not by cluster: a crossing sits at the mouth of the junction
+            # and the greedy clustering often puts it in a cluster of its own
+            near = veh[np.linalg.norm(sig[veh, :2] - sig[i, :2], axis=1)
+                       < self.INTERSECTION_RADIUS]
+            crossed = near[np.abs(np.cos(sig[near, 2] - sig[i, 2])) < 0.5]
+            if crossed.size:
+                # pair with the nearest crossed approach and take both its cycle and the
+                # opposite of its phase. Pairing against all of them does not always have
+                # an answer: at 20 of 139 crossings the traffic being cut across is itself
+                # split between the two groups, so no single pedestrian phase is antiphase
+                # to all of it. That is the two-phase model running out, not a bug.
+                nearest = crossed[np.argmin(
+                    np.linalg.norm(sig[crossed, :2] - sig[i, :2], axis=1))]
+                group[i] = 1 - group[nearest]
+                offset[i] = offset[nearest]
         self._sl_xy = torch.tensor(sig[:, :2], dtype=torch.float32, device=self.device)
         self._sl_dir = torch.tensor(sig[:, 2], dtype=torch.float32, device=self.device)
         self._sl_group = torch.tensor(group, device=self.device)
         self._sl_offset = torch.tensor(offset, device=self.device)
+        ped = np.zeros(len(sig), dtype=bool)
+        ped[n_vehicle:] = True
+        self._sl_ped = torch.tensor(ped, device=self.device)
+        self._sl_allowed = self._signal_participant_mask(owners)
+
+    def _add_crosswalk_signals(self, sig, owners):
+        """Give the crosswalks at a signalised junction a phase of their own.
+
+        Without this there is no pedestrian signal anywhere: every stop line in the map
+        belongs to a `road` lanelet, so pedestrians crossed whenever they liked and a car
+        met one on green as often as on red (measured: 50.6% green at the moment a car
+        first touched a pedestrian, against a 42.9% base rate).
+
+        A crossing is entered from either end, so each crosswalk contributes two stop
+        lines pointing inwards. The phase comes out of the *same* rule the vehicle
+        approaches use - group by direction relative to the junction's reference - which
+        is right by construction: a pedestrian crossing a road walks parallel to the
+        cross street, so grouping on their own heading puts them on the cross street's
+        green, exactly when the traffic they would meet is stopped.
+
+        Only crosswalks near an existing vehicle stop line get one. An unsignalised
+        crossing mid-block has no light in the map and must not gain a synthetic one.
+        """
+        if not sig:
+            return sig, owners
+        veh_xy = np.asarray([[s[0], s[1]] for s in sig], dtype=np.float64)
+        for ll in self.lanelet_map.laneletLayer:
+            if 'subtype' not in ll.attributes or ll.attributes['subtype'] != 'crosswalk':
+                continue
+            cl = np.asarray([(q.x, q.y) for q in ll.centerline], dtype=np.float64)
+            if cl.shape[0] < 2:
+                continue
+            if np.linalg.norm(veh_xy - cl.mean(axis=0), axis=1).min() > self.INTERSECTION_RADIUS:
+                continue                                   # unsignalised crossing
+            for entry, nxt in ((cl[0], cl[1]), (cl[-1], cl[-2])):
+                d = nxt - entry
+                sig.append((entry[0], entry[1], float(np.arctan2(d[1], d[0]))))
+                owners.append(ll)
+        return sig, owners
+
+    def _signal_participant_mask(self, owners):
+        """[NUM_TYPES, S] mask of which stop lines each type is judged against. The base
+        env has vehicles only, so every line applies to it."""
+        return torch.ones(self.NUM_TYPES, len(owners), dtype=torch.bool, device=self.device)
 
     def _light_state(self):
         """0 = red, 1 = amber, 2 = green, for every stop line at the current step."""
@@ -513,9 +586,12 @@ class AWSIMDrivingEnv:
         rel = self._sl_xy.unsqueeze(0) - state[:, :2].unsqueeze(1)      # [A, S, 2]
         ahead = (rel * fwd.unsqueeze(1)).sum(-1)                        # [A, S] signed
         dist = rel.norm(dim=-1)
-        # only a stop line in front, within range, and facing the way the agent drives
+        # only a stop line in front, within range, facing the way the agent drives, and
+        # meant for this participant - a pedestrian judged against a car's stop line was
+        # 49% of all red-light violations, and none of them meant anything
         aligned = torch.cos(psi.unsqueeze(1) - self._sl_dir.unsqueeze(0)) > 0.5
-        valid = aligned & (ahead > 0) & (dist < self.TL_RADIUS)
+        valid = (aligned & (ahead > 0) & (dist < self.TL_RADIUS)
+                 & self._sl_allowed[self._agent_types()])
         pick = torch.where(valid, dist, torch.full_like(dist, float('inf'))).min(dim=1)
         has = torch.isfinite(pick.values)
         idx = torch.where(has, pick.indices, torch.full_like(pick.indices, -1))

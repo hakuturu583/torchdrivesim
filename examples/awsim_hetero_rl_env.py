@@ -206,9 +206,10 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             cache = polyline_cumlen(pts)
             if cache[2][-1] < 15.0:                    # too short to leave a car on
                 continue
-            if self._sl_xy.shape[0]:
+            veh_sl = self._sl_xy[~self._sl_ped]        # crosswalk lines are not approaches
+            if veh_sl.shape[0]:
                 d = float(torch.cdist(torch.tensor(pts, dtype=torch.float32, device=self.device),
-                                      self._sl_xy).min())
+                                      veh_sl).min())
                 if d < self.INTERSECTION_RADIUS:       # still within a junction
                     continue
             # `left` is the neighbour a lane change may reach, `adjacentLeft` the one it
