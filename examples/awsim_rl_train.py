@@ -85,6 +85,7 @@ class PPOConfig:
     w_solidcross: float = 0.0        # crossing a line the map says may not be crossed
     w_collision_level: float = 0.0   # kept alongside the rise; 0 reproduces hit300
     value_norm: bool = False         # standardise the value targets (MAPPO)
+    obs_norm: bool = False           # running per-feature scaling of the observation
     penalty_scale: float = 1.0       # one dial on every penalty, see below
     goal_dist_scale: float = 1.0     # vehicle/motorcycle goal spacing, 1.0 = 150 m
     max_steer_scale: float = 1.0     # scales every type's geometric steering limit
@@ -209,6 +210,37 @@ class ValueNorm:
         return x * (self.var.sqrt() + 1e-8) + self.mean
 
 
+class ObsNorm:
+    """Running per-feature scaling of the observation.
+
+    "Always use observation normalization" is one of the flat recommendations in
+    arXiv:2006.05990. It divides by a running standard deviation but does *not*
+    subtract the mean, and that is deliberate: the partner and road blocks are
+    zero-padded, and the deep-sets max-pool reads an exactly-zero slot as "nobody
+    there". Centring would map an empty slot to some non-zero constant and make it
+    look like a neighbour. Dividing alone keeps the padding exact while still
+    equalising the scales, which is the part that matters here - this observation is
+    already hand-scaled to order one, so the expected gain is smaller than in an
+    environment fed raw units.
+    """
+
+    def __init__(self, dim, device, clip=10.0):
+        self.var = torch.ones(dim, device=device)
+        self.count = 1e-4
+        self.clip = clip
+
+    def update(self, x):
+        bv, bc = x.pow(2).mean(0), x.shape[0]      # second moment, mean left at zero
+        tot = self.count + bc
+        self.var = (self.var * self.count + bv * bc) / tot
+        self.count = tot
+
+    FLOOR = 0.05      # never amplify a feature by more than 20x
+
+    def __call__(self, x):
+        return (x / self.var.sqrt().clamp(min=self.FLOOR)).clamp(-self.clip, self.clip)
+
+
 def compute_gae(rewards, values, dones, last_value, gamma, lam):
     T, A = rewards.shape
     adv = torch.zeros(T, A, device=rewards.device)
@@ -265,6 +297,14 @@ def train(cfg: PPOConfig):
                       num_types=env.NUM_TYPES, type_slice=env.TYPE_ONEHOT_SLICE).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, eps=1e-8)
     vnorm = ValueNorm(dev) if cfg.value_norm else None
+    onorm = ObsNorm(od, dev) if cfg.obs_norm else None
+
+    def see(raw):
+        """What the policy is shown, and what gets stored for the update."""
+        if onorm is None:
+            return raw
+        onorm.update(raw)
+        return onorm(raw)
     if cfg.resume:
         net.load_state_dict(torch.load(cfg.resume, map_location=dev))
         print(f"[resume] loaded policy from {cfg.resume}")
@@ -275,7 +315,7 @@ def train(cfg: PPOConfig):
         run = wandb.init(project=cfg.wandb_project, name=(cfg.wandb_run or None),
                          config=OmegaConf.to_container(cfg, resolve=True))
 
-    obs = env.reset()
+    obs = see(env.reset())
     ep_return = torch.zeros(A, device=dev)
     history, sweep_hist = [], []
 
@@ -308,6 +348,7 @@ def train(cfg: PPOConfig):
             with torch.no_grad():
                 action, logp, value = net.act(obs)
             next_obs, reward, done, info = env.step(action)
+            next_obs = see(next_obs)
             b_obs[t], b_act[t], b_logp[t] = obs, action, logp
             b_val[t] = vnorm.denormalize(value) if vnorm else value
             b_rew[t], b_done[t] = reward, done.float()
@@ -328,7 +369,7 @@ def train(cfg: PPOConfig):
                     if k.startswith(('reached_', 'goals_', 'speed_')):
                         ep_reached_type.setdefault(k, []).append(v)
                 ep_return = torch.zeros(A, device=dev)
-                obs = env.reset()
+                obs = see(env.reset())
 
         with torch.no_grad():
             last_value = net(obs)[2]
@@ -436,14 +477,19 @@ def train(cfg: PPOConfig):
 
     torch.save(net.state_dict(), os.path.join(cfg.save_dir, "policy.pt"))
 
+    if onorm is not None:      # the policy is unusable without these
+        torch.save({'var': onorm.var, 'count': onorm.count},
+                   os.path.join(cfg.save_dir, 'obs_norm.pt'))
+
     # greedy evaluation rollout -> video
-    obs = env.reset()
+    obs = see(env.reset())
     cam = dict(follow=cfg.video_follow, fov=cfg.video_fov) if cfg.video_follow >= 0 else {}
     frames = [env.render_frame(**cam)]
     for _ in range(cfg.max_steps):
         with torch.no_grad():
             action, _, _ = net.act(obs, deterministic=True)
         obs, _, done, info = env.step(action)
+        obs = onorm(obs) if onorm is not None else obs
         frames.append(env.render_frame(**cam))
         if info['episode_end']:
             break

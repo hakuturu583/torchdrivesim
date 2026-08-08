@@ -118,6 +118,13 @@ PLANS = {
     # fixed 100 m / 50 m, which alone took the clamp saturation from 62% to 5%. That
     # moves the baseline, so it needs re-measuring before anything is read against it.
     "base": dict(),
+    # "Always use observation normalization" (arXiv:2006.05990). Scale only, no
+    # centring: the partner and road blocks are zero-padded and the deep-sets max-pool
+    # reads an exact zero as "nobody there", which centring would destroy. Expect
+    # little - measured over 512 agents the per-feature RMS already spans only
+    # 0.038-1.06, so the hand-picked scalings have done most of this job already.
+    "obsnorm": dict(obs_norm="true"),
+    "obsnorm2": dict(obs_norm="true", seed=123),
     # The other half of the same measurement. gamma=0.98 with dt=0.1 is a 5 s horizon,
     # about 35 m at the speed these agents drive, against a goal 150 m away - the +5 for
     # arriving discounts to 0.074, less than one step of penalties. `shortgoal` brings
