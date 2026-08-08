@@ -300,7 +300,7 @@ def train(cfg: PPOConfig):
         # infraction rates are averaged over the whole rollout.
         ep_reached, ep_reached_type, ep_goals, ep_lost = [], {}, [], []
         step_speed = []
-        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': [], 'lanechange': [], 'solidcross': []}
+        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': [], 'lanechange': [], 'solidcross': [], 'atfault': []}
 
         for t in range(cfg.rollout_steps):
             with torch.no_grad():
@@ -391,7 +391,8 @@ def train(cfg: PPOConfig):
               f"prox {mean_rule['proximity']:.3f} wrong {mean_rule['wrongway']:.2f} spd {mean_rule['speeding']:.2f}"
               f"/{mean_rule['speed_excess']:.2f} yld {mean_rule['failtoyield']:.3f} "
               f"lane {mean_rule['lane']:.3f} hit {mean_rule['contact']:.4f} "
-              f"chg {mean_rule['lanechange']:.4f}/{mean_rule['solidcross']:.4f} | "
+              f"chg {mean_rule['lanechange']:.4f}/{mean_rule['solidcross']:.4f} "
+              f"fault {mean_rule['atfault']:.2f} | "
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
             torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))

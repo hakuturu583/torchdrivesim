@@ -95,6 +95,19 @@ PLANS = {
     # vnorm's goals (2.57) and speed (0.56) both sit just above the two baselines but
     # inside a seed spread of 0.08. One replicate settles it.
     "vnorm2": dict(value_norm="true", seed=123),
+    # arXiv:2606.19370 gets human-compatible driving out of self-play with +1 for the
+    # goal, -1 for a collision or going off-road, and nothing else - "deliberately
+    # avoiding dense shaping". Thirteen shaped terms is the opposite bet, and the
+    # measurement that started this week says the shaped terms sum to more than the
+    # incentive to drive. This is the other end of the axis `balance` moved along.
+    "sparse": dict(w_progress=0.0, w_goal=1.0, w_collision=0.0, w_collision_level=1.0,
+                   w_offroad=1.0, w_redlight=0.0, w_wrongway=0.0, w_speeding=0.0,
+                   w_yield=0.0, w_proximity=0.0, w_lane=0.0, w_lanechange=0.0,
+                   w_solidcross=0.0),
+    "sparse2": dict(w_progress=0.0, w_goal=1.0, w_collision=0.0, w_collision_level=1.0,
+                    w_offroad=1.0, w_redlight=0.0, w_wrongway=0.0, w_speeding=0.0,
+                    w_yield=0.0, w_proximity=0.0, w_lane=0.0, w_lanechange=0.0,
+                    w_solidcross=0.0, seed=123),
 }
 
 DONE = re.compile(r"^\[done\] per-type (goals|v/limit)/agent?: (.*)$")

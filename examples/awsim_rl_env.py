@@ -920,6 +920,30 @@ class AWSIMDrivingEnv:
     # "TODO: batch across agent dimension"), so at A agents it issues A x small
     # kernels per step and is launch-overhead bound. This is the same `discs`
     # metric computed for all agent pairs at once.
+    def _at_fault(self, state):
+        """Contacts this agent started by driving into someone, as [A].
+
+        The contact rate counts both parties of every touch, so an agent that is
+        stationary when someone reaches it scores the same as the one that arrived -
+        and 36% of contacts here have a stationary party. NAVSIM and
+        arXiv:2606.19370 report *at-fault* collisions instead, contact caused by the
+        agent being scored. Fault is assigned to whichever party was closing on the
+        other faster along the line of centres at the moment contact began; if both
+        were closing at the same rate, both are at fault.
+        """
+        pairs = self._contact_pairs
+        new = pairs & ~self._prev_pairs
+        self._prev_pairs = pairs
+        if not bool(new.any()):
+            return torch.zeros(state.shape[0], device=self.device)
+        xy, psi, v = state[:, :2], state[:, 2], state[:, 3]
+        rel = xy.unsqueeze(0) - xy.unsqueeze(1)                    # [A, A, 2] j - i
+        n = rel / (rel.norm(dim=-1, keepdim=True) + 1e-6)          # unit i -> j
+        vel = torch.stack([torch.cos(psi), torch.sin(psi)], dim=-1) * v.unsqueeze(-1)
+        toward_j = (vel.unsqueeze(1) * n).sum(-1)                  # i closing on j
+        toward_i = (vel.unsqueeze(0) * -n).sum(-1)                 # j closing on i
+        return (new & (toward_j >= toward_i)).float().sum(dim=1)
+
     def _collision_weight(self):
         """[A] multiplier for hitting each agent. One road-user type here, so uniform."""
         return torch.ones(self.num_agents, device=self.device)
@@ -947,6 +971,7 @@ class AWSIMDrivingEnv:
         # pedestrian. Columns are weighted by the *other* agent's vulnerability, so the
         # heavier party pays more for the same event.
         overlap = overlap * self._collision_weight().unsqueeze(0)
+        self._contact_pairs = overlap > 0        # [A, A]; consumed by _at_fault
         return overlap.sum(dim=-1) * mask
 
     def _steering_params(self):
@@ -1244,6 +1269,8 @@ class AWSIMDrivingEnv:
         self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._off_run = torch.zeros(self.num_agents, device=self.device)
         self._prev_collision = torch.zeros(self.num_agents, device=self.device)
+        self._prev_pairs = torch.zeros(self.num_agents, self.num_agents,
+                                       dtype=torch.bool, device=self.device)
         self._prev_lane = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
         self._lane_valid = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._just_moved = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
@@ -1277,6 +1304,7 @@ class AWSIMDrivingEnv:
         progress = progress * (1.0 - offroad)      # no credit for shortcutting off-road
         redlight, wrongway, speeding, failtoyield = self._rule_violations(state)
         lane = self._lane_offset(state)
+        at_fault = self._at_fault(state)
         chg_legal, chg_solid = self._lane_change(state)
         # Charge driving *into* a contact, not sitting in one. The level counts a single
         # event for as many steps as the overlap lasts, so it is dominated by whoever is
@@ -1361,6 +1389,7 @@ class AWSIMDrivingEnv:
             'contact': mean_active(hit),
             'offroad': mean_active(offroad),
             'lane': mean_active(lane),
+            'atfault': at_fault.sum(),        # contacts this agent drove into, per step
             'lanechange': mean_active(chg_legal),
             'solidcross': mean_active(chg_solid),
             'active': active,
