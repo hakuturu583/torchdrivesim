@@ -85,6 +85,16 @@ PLANS = {
     # MAPPO's most influential factor, and the value loss here sits at 2-3 without
     # falling while the return is assembled from thirteen terms of very different scale.
     "vnorm": dict(value_norm="true"),
+    # Halving every penalty worked - goals 2.40-2.48 -> 2.72-2.74 and speed/limit 0.52 ->
+    # 0.61 across two seeds, with contact unchanged - but it also halved the offroad
+    # penalty, and offroad doubled while `lost` went 37-40 -> 73-98. The effect that
+    # mattered was making driving positive-expected-value, so buy the same surplus from
+    # the other side: leave the penalties alone and pay more for arriving.
+    "boost": dict(w_goal=12.0),
+    "boost2": dict(w_goal=12.0, seed=123),
+    # vnorm's goals (2.57) and speed (0.56) both sit just above the two baselines but
+    # inside a seed spread of 0.08. One replicate settles it.
+    "vnorm2": dict(value_norm="true", seed=123),
 }
 
 DONE = re.compile(r"^\[done\] per-type (goals|v/limit)/agent?: (.*)$")
