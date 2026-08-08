@@ -118,6 +118,15 @@ PLANS = {
     # fixed 100 m / 50 m, which alone took the clamp saturation from 62% to 5%. That
     # moves the baseline, so it needs re-measuring before anything is read against it.
     "base": dict(),
+    # The other half of the same measurement. gamma=0.98 with dt=0.1 is a 5 s horizon,
+    # about 35 m at the speed these agents drive, against a goal 150 m away - the +5 for
+    # arriving discounts to 0.074, less than one step of penalties. `shortgoal` brings
+    # the goal inside the horizon; this stretches the horizon to the goal instead:
+    # 1/(1-0.995) = 200 steps = 140 m. Left alone, `goal_dist` stays at 150 m.
+    # Watch the value loss - the return grows about fourfold in magnitude and nothing
+    # normalises it, which is the case `vnorm` was meant to cover.
+    "gamma995": dict(gamma=0.995),
+    "gamma995b": dict(gamma=0.995, seed=123),
     "sparse2": dict(w_progress=0.0, w_goal=1.0, w_collision=0.0, w_collision_level=1.0,
                     w_offroad=1.0, w_redlight=0.0, w_wrongway=0.0, w_speeding=0.0,
                     w_yield=0.0, w_proximity=0.0, w_lane=0.0, w_lanechange=0.0,
