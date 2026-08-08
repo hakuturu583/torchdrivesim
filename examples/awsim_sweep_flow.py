@@ -41,6 +41,7 @@ BASE = dict(
     w_proximity=0.1, ttc_threshold=3.0, w_lane=0.4,
     w_collision_level=0.0, lat_accel_max=4.0,
     w_lanechange=0.0, w_solidcross=0.0, max_steer_scale=1.0, goal_dist_scale=1.0,
+    w_follow=0.0,
     seed=42,
     value_norm="false", penalty_scale=1.0,
     checkpoint_every=50,
@@ -118,6 +119,17 @@ PLANS = {
     # fixed 100 m / 50 m, which alone took the clamp saturation from 62% to 5%. That
     # moves the baseline, so it needs re-measuring before anything is read against it.
     "base": dict(),
+    # The corridor. Instead of a bearing to one point 150 m along one lane, the policy
+    # is shown where each lane it may legally be in goes next - its own and the two it
+    # could change into - and is paid for ground covered while tracking *any* of them.
+    # The max over branches is the point: every lane is worth the same, so when to
+    # change lane stays a decision rather than something the route dictates. Cars and
+    # motorbikes only; a cyclist has 80 of 282 lanelets with a lane-changeable
+    # neighbour and a pedestrian has none, so both keep the goal-distance term.
+    # 0.2 puts the forward payment at about 0.098 per step at the speeds these agents
+    # drive, against the 0.047 the progress term was paying and the 0.111 of penalties.
+    "corridor": dict(w_follow=0.2),
+    "corridor2": dict(w_follow=0.2, seed=123),
     # "Always use observation normalization" (arXiv:2006.05990). Scale only, no
     # centring: the partner and road blocks are zero-padded and the deep-sets max-pool
     # reads an exact zero as "nobody there", which centring would destroy. Expect

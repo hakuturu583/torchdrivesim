@@ -87,6 +87,9 @@ class PPOConfig:
     value_norm: bool = False         # standardise the value targets (MAPPO)
     obs_norm: bool = False           # running per-feature scaling of the observation
     penalty_scale: float = 1.0       # one dial on every penalty, see below
+    branch_obs: bool = False         # add the branch preview to the observation
+    w_follow: float = 0.0            # pay for ground covered on-branch, not for
+                                     # closing on a distant goal point
     goal_dist_scale: float = 1.0     # vehicle/motorcycle goal spacing, 1.0 = 150 m
     max_steer_scale: float = 1.0     # scales every type's geometric steering limit
     lat_accel_max: float = 4.0       # m/s^2; the speed-dependent steering cap
@@ -290,6 +293,7 @@ def train(cfg: PPOConfig):
                   lat_accel_max=cfg.lat_accel_max, max_steer_scale=cfg.max_steer_scale,
                   **({'goal_dist_scale': cfg.goal_dist_scale} if cfg.hetero else {}),
                   w_lanechange=cfg.w_lanechange, w_solidcross=cfg.w_solidcross,
+                  w_follow=cfg.w_follow, branch_obs=cfg.branch_obs,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
@@ -342,7 +346,7 @@ def train(cfg: PPOConfig):
         # infraction rates are averaged over the whole rollout.
         ep_reached, ep_reached_type, ep_goals, ep_lost = [], {}, [], []
         step_speed = []
-        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': [], 'lanechange': [], 'solidcross': [], 'atfault': []}
+        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': [], 'lanechange': [], 'solidcross': [], 'atfault': [], 'follow': []}
 
         for t in range(cfg.rollout_steps):
             with torch.no_grad():
@@ -435,7 +439,7 @@ def train(cfg: PPOConfig):
               f"/{mean_rule['speed_excess']:.2f} yld {mean_rule['failtoyield']:.3f} "
               f"lane {mean_rule['lane']:.3f} hit {mean_rule['contact']:.4f} "
               f"chg {mean_rule['lanechange']:.4f}/{mean_rule['solidcross']:.4f} "
-              f"fault {mean_rule['atfault']:.2f} | "
+              f"fault {mean_rule['atfault']:.2f} flw {mean_rule['follow']:.3f} | "
               f"pg {last_stats[0]:.3f} vf {last_stats[1]:.3f} ent {last_stats[2]:.3f}", flush=True)
         if cfg.checkpoint_every and (update + 1) % cfg.checkpoint_every == 0:
             torch.save(net.state_dict(), os.path.join(cfg.save_dir, f"policy_{update + 1}.pt"))

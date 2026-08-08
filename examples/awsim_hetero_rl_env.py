@@ -94,7 +94,15 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  w_proximity=None, ttc_threshold=None, w_lane=None,
                  w_collision_level=None, lat_accel_max=None,
                  w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
-                 goal_dist_scale=1.0):
+                 goal_dist_scale=1.0, w_follow=None, branch_obs=None):
+        self.w_follow = self.W_FOLLOW if w_follow is None else w_follow
+        self.branch_obs = ((self.BRANCH_OBS if branch_obs is None else branch_obs)
+                           or self.w_follow > 0)
+        if self.branch_obs:
+            self.EGO_DIM = type(self).EGO_DIM + self.BRANCH_DIM
+            self.TYPE_ONEHOT_SLICE = (self.EGO_DIM - len(TYPES), self.EGO_DIM)
+            self.OBS_DIM = (self.EGO_DIM + self.MAX_PARTNERS * self.PARTNER_FEATURES
+                            + self.MAX_ROAD * self.ROAD_FEATURES)
         # Only the wheeled long-range types: a cyclist's 60 m already gives a 0.3 m
         # median chord error and a pedestrian's 20 m is shorter than its route.
         self.goal_dist_scale = goal_dist_scale
@@ -167,6 +175,9 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
         self._collision_vuln = torch.tensor(
             [COLLISION_WEIGHT[TYPES[t]] for t in self.agent_type_idx],
             dtype=torch.float32, device=device)
+        self._branch_wheeled = torch.tensor(
+            [TYPES[t] in ("vehicle", "motorcycle") for t in self.agent_type_idx],
+            device=device)
         self._build_spawn_pools()
         self._build_parking_spots()
         self.reset()
@@ -197,6 +208,13 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             ok = {ll.id: rules.canPass(ll) for ll in set(owners)}
             mask[i] = torch.tensor([ok[ll.id] for ll in owners], device=self.device)
         return mask
+
+    def _branch_types(self):
+        """Cars and motorbikes only. A cyclist's network has 80 of 282 lanelets with a
+        lane-changeable neighbour and a pedestrian's has none at all - every one of its
+        92 lanelets is an island with zero successors - so there are no branches to
+        describe for either, and they keep the goal-distance progress term."""
+        return self._branch_wheeled
 
     def _agent_types(self):
         return self._type_idx_t

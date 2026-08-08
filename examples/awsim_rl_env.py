@@ -59,6 +59,20 @@ class AWSIMDrivingEnv:
 
     ACT_DIM = 2
     EGO_DIM = 15              # speed, goal, prev action, signal (5), limit, must-yield
+    BRANCH_DIM = 27           # 3 branches x (4 preview points + a validity bit)
+    # Where each lane the agent could legally be in goes next, rather than a bearing to
+    # one point far along one of them. Three branches - the lane it is on and the two it
+    # may change into - each described by points at fixed distances ahead, plus a bit
+    # saying the branch exists. This is an affordance, not an instruction: every branch
+    # is equally rewarded, so *when* to change lane stays a decision the policy makes.
+    BRANCH_SPACING = 2.0             # m between points of the resampled lane path
+    BRANCH_POINTS = 31               # so each path covers 60 m
+    BRANCH_PREVIEW = (3, 5, 10, 17)  # indices ahead, i.e. 6, 10, 20 and 34 m
+    BRANCH_HALF_WIDTH = 2.0          # m of lateral error at which the follow score is 0
+    W_FOLLOW = 0.0                   # replaces w_progress for wheeled agents when > 0
+    # Off by default: turning it on changes OBS_DIM, so every run in a comparison has to
+    # agree about it. `w_follow > 0` implies it.
+    BRANCH_OBS = False
     MAX_PARTNERS = 16         # K nearest neighbours observed
     PARTNER_FEATURES = 8      # rel_x/y, width, length, rel_head_cos/sin, rel_speed, has_priority
     # 30 m was shorter than the braking distance of the faster agents: a motorcycle at
@@ -211,7 +225,15 @@ class AWSIMDrivingEnv:
                  w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
                  w_proximity=None, ttc_threshold=None, w_lane=None,
                  w_collision_level=None, lat_accel_max=None,
-                 w_lanechange=None, w_solidcross=None, max_steer_scale=1.0):
+                 w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
+                 w_follow=None, branch_obs=None):
+        self.w_follow = self.W_FOLLOW if w_follow is None else w_follow
+        self.branch_obs = ((self.BRANCH_OBS if branch_obs is None else branch_obs)
+                           or self.w_follow > 0)
+        if self.branch_obs:       # instance attribute, so the trainer sizes the net right
+            self.EGO_DIM = type(self).EGO_DIM + self.BRANCH_DIM
+            self.OBS_DIM = (self.EGO_DIM + self.MAX_PARTNERS * self.PARTNER_FEATURES
+                            + self.MAX_ROAD * self.ROAD_FEATURES)
         self.max_steer_scale = max_steer_scale
         self.w_lanechange = self.W_LANECHANGE if w_lanechange is None else w_lanechange
         self.w_solidcross = self.W_SOLIDCROSS if w_solidcross is None else w_solidcross
@@ -378,6 +400,7 @@ class AWSIMDrivingEnv:
         self._add_oncoming_turn_priority()
         self._build_downstream()
         self._build_lateral()
+        self._build_branch_paths()
 
     def _build_downstream(self):
         """[L, L] mask: lanelet j follows lanelet i within DOWNSTREAM_HOPS.
@@ -435,6 +458,117 @@ class AWSIMDrivingEnv:
                 if nb is not None and nb.id in order:
                     table[i, order[nb.id]] = True
         self._lane_legal, self._lane_solid = legal, solid & ~legal
+
+    def _build_branch_paths(self):
+        """For every drivable lanelet, the road ahead of it as a resampled polyline, and
+        the indices of the lanes to its left and right.
+
+        Built once. The successor chain takes the first `following` at each step, which
+        is arbitrary at a junction, but the block is a description of the road within
+        60 m and the junction geometry itself carries most of that.
+        """
+        order = self._lanelet_order
+        L, P, sp = len(order), self.BRANCH_POINTS, self.BRANCH_SPACING
+        xy = np.zeros((L, P, 2), dtype=np.float64)
+        hd = np.zeros((L, P), dtype=np.float64)
+        left = np.full(L, -1, dtype=np.int64)
+        right = np.full(L, -1, dtype=np.int64)
+        rules = lanelet2.traffic_rules.create(Locations.Germany, Participants.Vehicle)
+        graph = lanelet2.routing.RoutingGraph(self.lanelet_map, rules)
+        by_id = {ll.id: ll for ll in self.lanelet_map.laneletLayer if ll.id in order}
+        for lid, i in order.items():
+            ll = by_id.get(lid)
+            if ll is None:
+                continue
+            for nb, table in ((graph.left(ll), left), (graph.right(ll), right)):
+                if nb is not None and nb.id in order:
+                    table[i] = order[nb.id]
+            pts, seen, cur, total = [], {ll.id}, ll, 0.0
+            while total < P * sp:
+                pts.extend([(q.x, q.y) for q in cur.centerline])
+                total += float(lanelet2.geometry.length(cur.centerline))
+                nxt = [n for n in graph.following(cur) if n.id not in seen]
+                if not nxt:
+                    break
+                cur = nxt[0]
+                seen.add(cur.id)
+            a = np.asarray(pts, dtype=np.float64)
+            if a.shape[0] < 2:
+                a = np.repeat(np.asarray([[ll.centerline[0].x, ll.centerline[0].y]]), 2, 0)
+            cum = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(a, axis=0), axis=1))]
+            want = np.minimum(np.arange(P) * sp, cum[-1])
+            xy[i, :, 0] = np.interp(want, cum, a[:, 0])
+            xy[i, :, 1] = np.interp(want, cum, a[:, 1])
+            d = np.diff(xy[i], axis=0)
+            hd[i, :-1] = np.arctan2(d[:, 1], d[:, 0])
+            hd[i, -1] = hd[i, -2]
+        self._branch_xy = torch.tensor(xy, dtype=torch.float32, device=self.device)
+        self._branch_dir = torch.tensor(hd, dtype=torch.float32, device=self.device)
+        self._branch_side = torch.tensor(np.stack([np.arange(L), left, right], axis=-1),
+                                         device=self.device)          # [L, 3]
+
+    def _branch_types(self):
+        """Which agents get branches. One vehicle type in the base env, so all of them."""
+        return torch.ones(self.num_agents, dtype=torch.bool, device=self.device)
+
+    def _branches_cached(self, state):
+        """The observation block and the follow score both want this, and it is the
+        second most expensive thing in the step after the collision matrix."""
+        key = state.data_ptr(), state._version
+        if getattr(self, '_br_key', None) != key:
+            self._br_key, self._br_val = key, self._branches(state)
+        return self._br_val
+
+    def _branches(self, state):
+        """Lateral error, heading error and preview points for the three branches.
+
+        Returns (lat [A,3], head_err [A,3], valid [A,3], preview [A,3,K,2] in ego frame).
+        """
+        lane = self._agent_lanelet(state)
+        idx = self._branch_side[lane]                                   # [A, 3]
+        valid = (idx >= 0) & self._branch_types().unsqueeze(1)
+        j = idx.clamp(min=0)
+        path = self._branch_xy[j]                                       # [A, 3, P, 2]
+        # closest point on the polyline, by segment so the 2 m spacing does not add to
+        # the lateral error the way it did in _lane_offset
+        a, b = path[:, :, :-1, :], path[:, :, 1:, :]
+        ab = b - a
+        den = (ab * ab).sum(-1).clamp(min=1e-9)
+        rel = state[:, None, None, :2] - a
+        t = ((rel * ab).sum(-1) / den).clamp(0.0, 1.0)
+        foot = a + t.unsqueeze(-1) * ab
+        d = (state[:, None, None, :2] - foot).norm(dim=-1)              # [A, 3, P-1]
+        lat, seg = d.min(dim=-1)
+        head = torch.gather(self._branch_dir[j], 2, seg.unsqueeze(-1)).squeeze(-1)
+        head_err = torch.atan2(torch.sin(head - state[:, 2:3]),
+                               torch.cos(head - state[:, 2:3]))
+        k = torch.tensor(self.BRANCH_PREVIEW, device=self.device)
+        take = (seg.unsqueeze(-1) + k).clamp(max=self.BRANCH_POINTS - 1)  # [A, 3, K]
+        pts = torch.gather(path, 2, take.unsqueeze(-1).expand(-1, -1, -1, 2))
+        r = pts - state[:, None, None, :2]
+        c, sn = torch.cos(state[:, 2]), torch.sin(state[:, 2])
+        ego = torch.stack([c[:, None, None] * r[..., 0] + sn[:, None, None] * r[..., 1],
+                           -sn[:, None, None] * r[..., 0] + c[:, None, None] * r[..., 1]],
+                          dim=-1) / (self.BRANCH_POINTS * self.BRANCH_SPACING)
+        return lat, head_err, valid, ego * valid[..., None, None]
+
+    def _branch_block(self, state):
+        """[A, 3 * (2K + 1)] - the branch preview as the policy sees it."""
+        _, _, valid, ego = self._branches_cached(state)
+        A = state.shape[0]
+        return torch.cat([ego.reshape(A, 3, -1), valid.float().unsqueeze(-1)],
+                         dim=-1).reshape(A, -1)
+
+    def _follow_score(self, state):
+        """How well the agent is tracking *any* of its branches, in [0, 1].
+
+        A max over branches, so nothing here says which lane to be in - only that it
+        should be in one of them, pointing the way that lane goes.
+        """
+        lat, head_err, valid, _ = self._branches_cached(state)
+        score = ((1.0 - lat / self.BRANCH_HALF_WIDTH).clamp(0.0, 1.0)
+                 * torch.relu(torch.cos(head_err)))
+        return (score * valid).max(dim=1).values
 
     def _lane_change(self, state):
         """(legal, over-a-solid-line) indicators for stepping onto a neighbouring lane
@@ -1162,7 +1296,8 @@ class AWSIMDrivingEnv:
             self._yield_lanelet[lane].float(),      # "I have to give way here"
         ], dim=-1)
         # the signal block is what makes the red-light penalty learnable
-        return torch.cat([base, self._signals_cached(state)[2]], dim=-1)
+        out = torch.cat([base, self._signals_cached(state)[2]], dim=-1)
+        return torch.cat([out, self._branch_block(state)], dim=-1) if self.branch_obs else out
 
     def _partner_extra(self, nidx, valid):
         """Optional extra per-neighbour features (e.g. type one-hot). None in base."""
@@ -1323,7 +1458,19 @@ class AWSIMDrivingEnv:
         hit = (collision - self._prev_collision).clamp(min=0.0) * (~self._just_moved)
         self._prev_collision, self._just_moved = collision, torch.zeros_like(self._just_moved)
         newly_reached = (dist < self.goal_radius) & (~was_reached)
-        reward = (self.w_progress * progress - self.w_collision * hit
+        # Forward motion is paid for either by closing on a goal point, or - when
+        # w_follow is on - by covering ground while tracking one of the branches. The
+        # second form has no bearing to a distant point in it at all, which is what made
+        # the first one tell a car in lane to head sideways.
+        if self.w_follow > 0:
+            info_follow = self._follow_score(state)
+            forward = torch.where(self._branch_types(),
+                                  self.w_follow * state[:, 3].abs() * self.dt * info_follow,
+                                  self.w_progress * progress)
+        else:
+            info_follow = torch.zeros_like(progress)
+            forward = self.w_progress * progress
+        reward = (forward - self.w_collision * hit
                   - self.w_collision_level * collision
                   - self.w_lanechange * chg_legal - self.w_solidcross * chg_solid
                   - self.w_offroad * offroad + self.w_goal * newly_reached.float()
@@ -1398,6 +1545,7 @@ class AWSIMDrivingEnv:
             'contact': mean_active(hit),
             'offroad': mean_active(offroad),
             'lane': mean_active(lane),
+            'follow': mean_active(info_follow),
             'atfault': at_fault.sum(),        # contacts this agent drove into, per step
             'lanechange': mean_active(chg_legal),
             'solidcross': mean_active(chg_solid),
