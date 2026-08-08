@@ -1038,6 +1038,10 @@ class AWSIMDrivingEnv:
         self._s_goal = np.minimum(np.asarray(s_start, dtype=np.float64) + self._goal_dist,
                                   self._route_totals())
         self._s_goal0 = self._s_goal.copy()   # restored by reset()
+        # the ego block is normalised by each agent's own goal spacing, so the features
+        # stay in range whatever that spacing is - see _ego_features
+        self._goal_scale = torch.as_tensor(self._goal_dist, dtype=torch.float32,
+                                           device=self.device).clamp(min=1.0)
         self._goals_np = np.zeros((self.num_agents, 2), dtype=np.float32)
         self._route_exhausted = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._goals_reached = torch.zeros(self.num_agents, device=self.device)
@@ -1143,11 +1147,16 @@ class AWSIMDrivingEnv:
         gy_e = -s * dx + c * dy
         dist = torch.linalg.norm(torch.stack([dx, dy], -1), dim=-1)
         head_err = torch.atan2(gy_e, gx_e)
+        # Normalised by the agent's own goal spacing rather than a fixed 100 m / 50 m.
+        # A vehicle's goal sits 150 m away, so the old constants pinned all three of
+        # these features at their clamp for 62% of its steps: distance, and both
+        # components of the goal's position, were literally constant while it drove.
+        gs = self._goal_scale
         base = torch.stack([
             v / 10.0,
-            dist.clamp(max=100.0) / 50.0,
+            (dist / gs).clamp(max=2.0),
             torch.cos(head_err), torch.sin(head_err),
-            (gx_e / 50.0).clamp(-2, 2), (gy_e / 50.0).clamp(-2, 2),
+            (gx_e / gs).clamp(-2, 2), (gy_e / gs).clamp(-2, 2),
             prev_action[:, 0], prev_action[:, 1],
             limit / 10.0,
             self._yield_lanelet[lane].float(),      # "I have to give way here"

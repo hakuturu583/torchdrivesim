@@ -40,7 +40,8 @@ BASE = dict(
     w_redlight=0.5, w_wrongway=0.2, w_speeding=0.05, w_yield=0.4,
     w_proximity=0.1, ttc_threshold=3.0, w_lane=0.4,
     w_collision_level=0.0, lat_accel_max=4.0,
-    w_lanechange=0.0, w_solidcross=0.0, max_steer_scale=1.0, seed=42,
+    w_lanechange=0.0, w_solidcross=0.0, max_steer_scale=1.0, goal_dist_scale=1.0,
+    seed=42,
     value_norm="false", penalty_scale=1.0,
     checkpoint_every=50,
 )
@@ -104,6 +105,19 @@ PLANS = {
                    w_offroad=1.0, w_redlight=0.0, w_wrongway=0.0, w_speeding=0.0,
                    w_yield=0.0, w_proximity=0.0, w_lane=0.0, w_lanechange=0.0,
                    w_solidcross=0.0),
+    # The goal sat 150 m away while gamma=0.98 gives a 5 s horizon - about 35 m at the
+    # speed these agents drive - so the +5 for arriving was worth 0.074 discounted,
+    # less than one step of the 0.111 penalty budget. The value function could not see
+    # it. Worse, the bearing to a point that far along a curving route is a chord, not
+    # the road: 34% of vehicle steps had the goal more than 30 degrees off the lane
+    # direction, median 17.6 m of lateral offset against a 3 m lane. Shortening it to
+    # 50 m takes the median offset to 2.1 m.
+    "shortgoal": dict(goal_dist_scale=0.3333),
+    "shortgoal2": dict(goal_dist_scale=0.3333, seed=123),
+    # The ego block is now normalised by each agent's own goal spacing instead of a
+    # fixed 100 m / 50 m, which alone took the clamp saturation from 62% to 5%. That
+    # moves the baseline, so it needs re-measuring before anything is read against it.
+    "base": dict(),
     "sparse2": dict(w_progress=0.0, w_goal=1.0, w_collision=0.0, w_collision_level=1.0,
                     w_offroad=1.0, w_redlight=0.0, w_wrongway=0.0, w_speeding=0.0,
                     w_yield=0.0, w_proximity=0.0, w_lane=0.0, w_lanechange=0.0,

@@ -86,6 +86,7 @@ class PPOConfig:
     w_collision_level: float = 0.0   # kept alongside the rise; 0 reproduces hit300
     value_norm: bool = False         # standardise the value targets (MAPPO)
     penalty_scale: float = 1.0       # one dial on every penalty, see below
+    goal_dist_scale: float = 1.0     # vehicle/motorcycle goal spacing, 1.0 = 150 m
     max_steer_scale: float = 1.0     # scales every type's geometric steering limit
     lat_accel_max: float = 4.0       # m/s^2; the speed-dependent steering cap
     w_lane: float = 0.4         # lateral offset from the lane centre (see W_LANE)
@@ -255,6 +256,7 @@ def train(cfg: PPOConfig):
                   w_proximity=cfg.w_proximity, ttc_threshold=cfg.ttc_threshold,
                   w_lane=cfg.w_lane, w_collision_level=cfg.w_collision_level,
                   lat_accel_max=cfg.lat_accel_max, max_steer_scale=cfg.max_steer_scale,
+                  **({'goal_dist_scale': cfg.goal_dist_scale} if cfg.hetero else {}),
                   w_lanechange=cfg.w_lanechange, w_solidcross=cfg.w_solidcross,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM

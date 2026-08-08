@@ -93,7 +93,11 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  w_redlight=None, w_wrongway=None, w_speeding=None, w_yield=None,
                  w_proximity=None, ttc_threshold=None, w_lane=None,
                  w_collision_level=None, lat_accel_max=None,
-                 w_lanechange=None, w_solidcross=None, max_steer_scale=1.0):
+                 w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
+                 goal_dist_scale=1.0):
+        # Only the wheeled long-range types: a cyclist's 60 m already gives a 0.3 m
+        # median chord error and a pedestrian's 20 m is shorter than its route.
+        self.goal_dist_scale = goal_dist_scale
         self.max_steer_scale = max_steer_scale
         self.w_lanechange = self.W_LANECHANGE if w_lanechange is None else w_lanechange
         self.w_solidcross = self.W_SOLIDCROSS if w_solidcross is None else w_solidcross
@@ -528,7 +532,9 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             placed.append((x, y, 0.5 * max(spec["size"]) + self.spawn_gap))
             starts.append((x, y)); headings.append(h); goals.append((gx, gy))
             polys.append(poly); ends.append(end); pkeys.append(spec["participant"])
-            s0s.append(s0); gaps.append(spec["goal_dist"])
+            scale = (self.goal_dist_scale
+                     if TYPES[tidx] in ("vehicle", "motorcycle") else 1.0)
+            s0s.append(s0); gaps.append(spec["goal_dist"] * scale)
 
         A = self.num_agents
         self._parked = torch.zeros(A, dtype=torch.bool, device=self.device)
