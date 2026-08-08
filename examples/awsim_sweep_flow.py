@@ -41,7 +41,7 @@ BASE = dict(
     w_proximity=0.1, ttc_threshold=3.0, w_lane=0.4,
     w_collision_level=0.0, lat_accel_max=4.0,
     w_lanechange=0.0, w_solidcross=0.0, max_steer_scale=1.0, goal_dist_scale=1.0,
-    w_follow=0.0,
+    w_follow=0.0, terminate_on_teleport="false",
     seed=42,
     value_norm="false", penalty_scale=1.0,
     checkpoint_every=50,
@@ -128,6 +128,13 @@ PLANS = {
     # neighbour and a pedestrian has none, so both keep the goal-distance term.
     # 0.2 puts the forward payment at about 0.098 per step at the speeds these agents
     # drive, against the 0.047 the progress term was paying and the 0.111 of penalties.
+    # A respawn drops the agent somewhere unrelated, and `done` was never set for it, so
+    # GAE bootstrapped V(that unrelated place) into the very step that earned the goal.
+    # 1040 transitions an episode, and they are the ones that matter most. Terminating
+    # them makes the last goal a real boundary for that agent, after which it starts
+    # again from a freshly drawn spawn point.
+    "teledone": dict(terminate_on_teleport="true"),
+    "teledone2": dict(terminate_on_teleport="true", seed=123),
     "corridor": dict(w_follow=0.2),
     "corridor2": dict(w_follow=0.2, seed=123),
     # "Always use observation normalization" (arXiv:2006.05990). Scale only, no

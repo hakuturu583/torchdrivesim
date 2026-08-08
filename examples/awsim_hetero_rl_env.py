@@ -94,7 +94,13 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  w_proximity=None, ttc_threshold=None, w_lane=None,
                  w_collision_level=None, lat_accel_max=None,
                  w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
-                 goal_dist_scale=1.0, w_follow=None, branch_obs=None):
+                 goal_dist_scale=1.0, w_follow=None, branch_obs=None,
+                 despawn_at_goal=None, terminate_on_teleport=None):
+        self.terminate_on_teleport = (self.TERMINATE_ON_TELEPORT
+                                      if terminate_on_teleport is None
+                                      else terminate_on_teleport)
+        self.despawn_at_goal = (self.DESPAWN_AT_GOAL if despawn_at_goal is None
+                                else despawn_at_goal)
         self.w_follow = self.W_FOLLOW if w_follow is None else w_follow
         self.branch_obs = ((self.BRANCH_OBS if branch_obs is None else branch_obs)
                            or self.w_follow > 0)

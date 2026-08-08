@@ -87,6 +87,8 @@ class PPOConfig:
     value_norm: bool = False         # standardise the value targets (MAPPO)
     obs_norm: bool = False           # running per-feature scaling of the observation
     penalty_scale: float = 1.0       # one dial on every penalty, see below
+    terminate_on_teleport: bool = False   # a respawn ends that agent's episode
+    despawn_at_goal: bool = False    # the last goal ends that agent's episode
     branch_obs: bool = False         # add the branch preview to the observation
     w_follow: float = 0.0            # pay for ground covered on-branch, not for
                                      # closing on a distant goal point
@@ -294,6 +296,8 @@ def train(cfg: PPOConfig):
                   **({'goal_dist_scale': cfg.goal_dist_scale} if cfg.hetero else {}),
                   w_lanechange=cfg.w_lanechange, w_solidcross=cfg.w_solidcross,
                   w_follow=cfg.w_follow, branch_obs=cfg.branch_obs,
+                  despawn_at_goal=cfg.despawn_at_goal,
+                  terminate_on_teleport=cfg.terminate_on_teleport,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
@@ -346,7 +350,7 @@ def train(cfg: PPOConfig):
         # infraction rates are averaged over the whole rollout.
         ep_reached, ep_reached_type, ep_goals, ep_lost = [], {}, [], []
         step_speed = []
-        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': [], 'lanechange': [], 'solidcross': [], 'atfault': [], 'follow': []}
+        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': [], 'lanechange': [], 'solidcross': [], 'atfault': [], 'follow': [], 'present': []}
 
         for t in range(cfg.rollout_steps):
             with torch.no_grad():

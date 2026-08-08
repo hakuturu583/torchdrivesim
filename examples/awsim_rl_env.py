@@ -73,6 +73,18 @@ class AWSIMDrivingEnv:
     # Off by default: turning it on changes OBS_DIM, so every run in a comparison has to
     # agree about it. `w_follow > 0` implies it.
     BRANCH_OBS = False
+    # What happens when a route runs out of map. The default puts the agent on a fresh
+    # route somewhere else, which is why `reached` reads 0.00 in every log: a route is
+    # effectively infinite and there is no such thing as arriving. Despawning instead
+    # makes the last goal final - the agent stops being simulated, stops colliding and
+    # stops being drawn - at the cost of the scene thinning out over an episode.
+    DESPAWN_AT_GOAL = False
+    # A respawn moves the agent to an unrelated part of the map, but `done` was not set
+    # for it, so GAE bootstrapped V(somewhere else) into the step that earned the goal -
+    # the agent was scored on wherever it happened to be dropped. Terminating the
+    # transition makes the last goal a real episode boundary for that agent, after which
+    # it starts again from a freshly drawn spawn point.
+    TERMINATE_ON_TELEPORT = False
     MAX_PARTNERS = 16         # K nearest neighbours observed
     PARTNER_FEATURES = 8      # rel_x/y, width, length, rel_head_cos/sin, rel_speed, has_priority
     # 30 m was shorter than the braking distance of the faster agents: a motorcycle at
@@ -226,7 +238,13 @@ class AWSIMDrivingEnv:
                  w_proximity=None, ttc_threshold=None, w_lane=None,
                  w_collision_level=None, lat_accel_max=None,
                  w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
-                 w_follow=None, branch_obs=None):
+                 w_follow=None, branch_obs=None, despawn_at_goal=None,
+                 terminate_on_teleport=None):
+        self.terminate_on_teleport = (self.TERMINATE_ON_TELEPORT
+                                      if terminate_on_teleport is None
+                                      else terminate_on_teleport)
+        self.despawn_at_goal = (self.DESPAWN_AT_GOAL if despawn_at_goal is None
+                                else despawn_at_goal)
         self.w_follow = self.W_FOLLOW if w_follow is None else w_follow
         self.branch_obs = ((self.BRANCH_OBS if branch_obs is None else branch_obs)
                            or self.w_follow > 0)
@@ -1231,6 +1249,7 @@ class AWSIMDrivingEnv:
         # a teleport changes the overlap discontinuously; that jump is not the agent
         # driving into anything, so the next step must not charge it
         self._just_moved = self._just_moved | m
+        self._teleported = self._teleported | m
         self.simulator.set_state(state.unsqueeze(0), mask=m.unsqueeze(0))
         return True
 
@@ -1251,11 +1270,13 @@ class AWSIMDrivingEnv:
                 if self._extend_route(i):
                     total = float(self._route_cache[i][2][-1])
                 else:
-                    pose = self._respawn(i)
-                    if pose is None:   # nowhere to go: the agent stops earning goals
+                    pose = None if self.despawn_at_goal else self._respawn(i)
+                    if pose is None:   # nowhere to go: this was the last goal
                         self._route_exhausted[i] = True
                         self._any_finished = True
                         self._s_goal[i] = total
+                        if self.despawn_at_goal:
+                            self._despawn.append(i)
                         continue
                     moved.append((i, pose))
                     total = float(self._route_cache[i][2][-1])
@@ -1422,6 +1443,9 @@ class AWSIMDrivingEnv:
             self._parked = torch.zeros(self.num_agents, dtype=torch.bool, device=self.device)
         self._lost_count = 0
         self._any_finished = False
+        self._despawn = []
+        if self.despawn_at_goal:      # _build_simulator makes a fresh all-present mask
+            self._n_despawned = 0
         self._prev_sl_idx = torch.full((self.num_agents,), -1, dtype=torch.long, device=self.device)
         self._prev_sl_signed = torch.zeros(self.num_agents, device=self.device)
         state = self._state()
@@ -1431,6 +1455,8 @@ class AWSIMDrivingEnv:
     def step(self, action):
         action = torch.as_tensor(action, dtype=torch.float32, device=self.device).clamp(-1, 1)
         was_reached = self._reached.clone()          # agents that already finished before this step
+        self._teleported = torch.zeros(self.num_agents, dtype=torch.bool,
+                                       device=self.device)
         action = self._limit_steering(action, self._state())
         # parked cars never act: they are scenery the policy has to drive around, and they
         # are excluded from training so their (meaningless) transitions carry no gradient
@@ -1490,6 +1516,7 @@ class AWSIMDrivingEnv:
                 state = self._state()
                 dist = self._dist_to_goal(state)
             self._off_run = self._off_run * (~lost).float()
+        self._despawn = []
         self._goals_reached += newly_reached.float()
         if self.rolling_goals:
             # Hand out the next goal instead of parking the agent. Only an agent whose
@@ -1503,6 +1530,12 @@ class AWSIMDrivingEnv:
             self._reached = was_reached | (newly_reached & self._route_exhausted)
         else:
             self._reached = was_reached | (dist < self.goal_radius)
+        if self._despawn:
+            # out of the collision, proximity and off-road sums, and out of the picture
+            m = self.simulator.get_present_mask().clone()
+            for i in self._despawn:
+                m[0, i] = False
+            self.simulator.present_mask = m
         # Freeze finished agents in place so they stop moving and don't drift into others.
         # `_any_finished` is maintained on the host by _advance_goals, so the freeze
         # check needs no device read at all - with rolling goals it is almost never set
@@ -1513,6 +1546,8 @@ class AWSIMDrivingEnv:
         self._prev_dist = dist
         self._prev_action = action
         done = self._reached.clone() | (self._t >= self.max_steps)
+        if self.terminate_on_teleport:
+            done = done | self._teleported
         # `active` marks transitions that count for training: an agent's steps are
         # valid up to and including the step it reaches the goal, then excluded.
         active = ~was_reached & ~self._parked
@@ -1528,6 +1563,7 @@ class AWSIMDrivingEnv:
             'reached': self._reached.float().mean(),
             'goals': self._goals_reached.mean(),          # goals collected per agent
             'lost': self._lost_count,                     # python int, no sync
+            'present': self.simulator.get_present_mask()[0].float().mean(),
             'proximity': mean_active(proximity),
             # mean speed against the limit. Without this in the log a policy that has
             # simply stopped reads as perfect on every rule metric - which is exactly
@@ -1568,7 +1604,9 @@ class AWSIMDrivingEnv:
         cam = torch.tensor([[centre]], device=self.device)
         psi = torch.zeros(1, 1, 1, device=self.device)
         fov = self.render_fov if fov is None else fov
+        # the renderer does not consult present_mask on its own
+        rmask = self.simulator.get_present_mask().unsqueeze(1)
         img = self.simulator.render(camera_xy=cam, camera_psi=psi,
                                     res=Resolution(self.render_res, self.render_res),
-                                    fov=fov)
+                                    fov=fov, rendering_mask=rmask)
         return img[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
