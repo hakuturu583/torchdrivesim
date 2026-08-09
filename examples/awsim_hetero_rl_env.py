@@ -96,7 +96,14 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
                  goal_dist_scale=1.0, w_follow=None, branch_obs=None,
                  despawn_at_goal=None, terminate_on_teleport=None, offroad_fix=None,
-                 capsule_risk=None, proximity_per_type=None, crosswalk_priority=None):
+                 capsule_risk=None, proximity_per_type=None, crosswalk_priority=None,
+                 offroad_terminal=None, w_offroad_event=None, offroad_indicator=None):
+        self.offroad_indicator = (self.OFFROAD_INDICATOR if offroad_indicator is None
+                                  else offroad_indicator)
+        self.offroad_terminal = (self.OFFROAD_TERMINAL if offroad_terminal is None
+                                 else offroad_terminal)
+        self.w_offroad_event = (self.W_OFFROAD_EVENT if w_offroad_event is None
+                                else w_offroad_event)
         self.capsule_risk = self.CAPSULE_RISK if capsule_risk is None else capsule_risk
         self.proximity_per_type = (self.PROXIMITY_PER_TYPE if proximity_per_type is None
                                    else proximity_per_type)
@@ -221,6 +228,13 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
             ok = {ll.id: rules.canPass(ll) for ll in set(owners)}
             mask[i] = torch.tensor([ok[ll.id] for ll in owners], device=self.device)
         return mask
+
+    def _offroad_types(self):
+        """Cars and motorbikes. Off the drivable surface means something for a vehicle -
+        it is in a building. It means nothing for a pedestrian, whose whole network is
+        84 crosswalks and 8 walkways with the road running underneath them, or for a
+        cyclist riding between the two."""
+        return self._branch_wheeled
 
     def _branch_types(self):
         """Cars and motorbikes only. A cyclist's network has 80 of 282 lanelets with a

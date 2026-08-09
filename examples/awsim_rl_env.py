@@ -109,6 +109,27 @@ class AWSIMDrivingEnv:
     # A crossing that a road lanelet passes through gives that road lanelet something to
     # give way to.
     CROSSWALK_PRIORITY = False
+    # Off the drivable surface is not a lane to be discouraged from, it is not a mapped
+    # surface at all - the mesh covers roads, crosswalks and walkways alike, which is why
+    # a pedestrian on a crossing reads 0.000. There is nothing to be gained by modelling
+    # degrees of being inside a building. Charge it once and end that agent's episode;
+    # it starts again from a freshly drawn spawn point like any other respawn.
+    #
+    # This replaces three pieces of machinery that all misread `_offroad` as an indicator
+    # when it returns metres: the per-step penalty that scaled without bound (0.6 x a
+    # median 2.07 = 1.24 a step), the progress gate that reversed sign on 72% of
+    # off-road steps, and `_off_run`, whose "20 steps of patience" is
+    # `(run + offroad) * offroad` - at a 2.07 m overhang that passes 20 on the *third*
+    # step, while a 0.5 m overhang never passes it at all.
+    # The indicator form on its own, which is what every paper read for this uses
+    # (GPUDrive/Emerge-Lab: -w_offroad x I[offroad], w = 0.5; arXiv:2606.19370: -1 for a
+    # collision or off-road event). Terminating on top of it is an extrapolation - the
+    # nearest published thing is GPUDrive's appendix comparing removing an agent at
+    # collision against ignoring it - so the two are separate flags and separate runs.
+    OFFROAD_INDICATOR = False
+    OFFROAD_TERMINAL = False
+    OFFROAD_TERMINAL_M = 1.0         # summed corner overhang that counts as off the map
+    W_OFFROAD_EVENT = 1.0            # charged once, in place of the per-step penalty
     MAX_PARTNERS = 16         # K nearest neighbours observed
     PARTNER_FEATURES = 8      # rel_x/y, width, length, rel_head_cos/sin, rel_speed, has_priority
     # 30 m was shorter than the braking distance of the faster agents: a motorcycle at
@@ -264,7 +285,14 @@ class AWSIMDrivingEnv:
                  w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
                  w_follow=None, branch_obs=None, despawn_at_goal=None,
                  terminate_on_teleport=None, offroad_fix=None, capsule_risk=None,
-                 proximity_per_type=None, crosswalk_priority=None):
+                 proximity_per_type=None, crosswalk_priority=None,
+                 offroad_terminal=None, w_offroad_event=None, offroad_indicator=None):
+        self.offroad_indicator = (self.OFFROAD_INDICATOR if offroad_indicator is None
+                                  else offroad_indicator)
+        self.offroad_terminal = (self.OFFROAD_TERMINAL if offroad_terminal is None
+                                 else offroad_terminal)
+        self.w_offroad_event = (self.W_OFFROAD_EVENT if w_offroad_event is None
+                                else w_offroad_event)
         self.capsule_risk = self.CAPSULE_RISK if capsule_risk is None else capsule_risk
         self.proximity_per_type = (self.PROXIMITY_PER_TYPE if proximity_per_type is None
                                    else proximity_per_type)
@@ -560,6 +588,10 @@ class AWSIMDrivingEnv:
 
     def _branch_types(self):
         """Which agents get branches. One vehicle type in the base env, so all of them."""
+        return torch.ones(self.num_agents, dtype=torch.bool, device=self.device)
+
+    def _offroad_types(self):
+        """Which agents off-road means anything for. One vehicle type here, so all."""
         return torch.ones(self.num_agents, dtype=torch.bool, device=self.device)
 
     def _branches_cached(self, state):
@@ -1564,10 +1596,22 @@ class AWSIMDrivingEnv:
         collision = (self._collision(state) > 0).float()
         offroad = (self._offroad(state) > 0).float()
         proximity = self._proximity(state)
-        if self.offroad_fix:
+        if self.offroad_terminal:
+            # one charge, then the agent is done and respawns; no per-step term at all
+            off_gone = (offroad >= self.OFFROAD_TERMINAL_M) & self._offroad_types()
+            off_cost = off_gone.float() * (self.w_offroad_event / max(self.w_offroad, 1e-9))
+            progress = progress * (~off_gone).float()
+        elif self.offroad_indicator:
+            off_gone = None
+            gone = ((offroad >= self.OFFROAD_TERMINAL_M) & self._offroad_types()).float()
+            off_cost = gone * (self.w_offroad_event / max(self.w_offroad, 1e-9))
+            progress = progress * (1.0 - gone)
+        elif self.offroad_fix:
+            off_gone = None
             off_cost = offroad.clamp(max=self.OFFROAD_CAP)
             progress = progress * (offroad <= 0).float()   # withheld, never reversed
         else:
+            off_gone = None
             off_cost = offroad
             progress = progress * (1.0 - offroad)  # no credit for shortcutting off-road
         redlight, wrongway, speeding, failtoyield = self._rule_violations(state)
@@ -1610,8 +1654,11 @@ class AWSIMDrivingEnv:
         reward = torch.where(was_reached, torch.zeros_like(reward), reward)   # finished agents get 0
 
         # a sustained excursion means the agent is lost, not clipping a kerb
-        self._off_run = (self._off_run + offroad) * offroad
-        lost = self._off_run >= self.OFFROAD_PATIENCE
+        if self.offroad_terminal:
+            lost = off_gone            # no patience: off the map is off the map
+        else:
+            self._off_run = (self._off_run + offroad) * offroad
+            lost = self._off_run >= self.OFFROAD_PATIENCE
         # one fused read for the three rare events below, instead of one each
         flags = torch.stack([lost.any(), newly_reached.any()]).tolist()
         if self.rolling_goals and flags[0]:
@@ -1649,7 +1696,7 @@ class AWSIMDrivingEnv:
         self._prev_dist = dist
         self._prev_action = action
         done = self._reached.clone() | (self._t >= self.max_steps)
-        if self.terminate_on_teleport:
+        if self.terminate_on_teleport or self.offroad_terminal:
             done = done | self._teleported
         # `active` marks transitions that count for training: an agent's steps are
         # valid up to and including the step it reaches the goal, then excluded.

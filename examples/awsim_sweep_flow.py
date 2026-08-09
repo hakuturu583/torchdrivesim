@@ -43,6 +43,7 @@ BASE = dict(
     w_lanechange=0.0, w_solidcross=0.0, max_steer_scale=1.0, goal_dist_scale=1.0,
     w_follow=0.0, terminate_on_teleport="false", offroad_fix="false",
     proximity_per_type="false", crosswalk_priority="false",
+    offroad_indicator="false", offroad_terminal="false",
     seed=42,
     value_norm="false", penalty_scale=1.0,
     checkpoint_every=50,
@@ -148,6 +149,16 @@ PLANS = {
     # conflict was left unmodelled, so driving through an occupied crossing broke no rule.
     # Measured on the trained policy: per-type proximity 0.113 -> 0.121, and give-way
     # lanelets 254 -> 379 taking the failure-to-yield rate 0.046 -> 0.118.
+    # Off the drivable surface is not a lane, it is not a mapped surface at all - the
+    # mesh covers roads, crosswalks and walkways alike. `offroadind` charges it once per
+    # step as an indicator, which is the form every paper read for this uses;
+    # `offroadterm` ends that agent's episode on top, which is an extrapolation from
+    # GPUDrive's appendix on removing agents at collision. Cars and motorbikes only: a
+    # pedestrian's whole network sits on top of the roads and reads 0.000 off-road.
+    "offroadind": dict(offroad_indicator="true"),
+    "offroadind2": dict(offroad_indicator="true", seed=123),
+    "offroadterm": dict(offroad_terminal="true"),
+    "offroadterm2": dict(offroad_terminal="true", seed=123),
     "vru": dict(proximity_per_type="true"),
     "vru2": dict(proximity_per_type="true", seed=123),
     "crosswalk": dict(crosswalk_priority="true"),

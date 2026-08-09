@@ -87,6 +87,9 @@ class PPOConfig:
     value_norm: bool = False         # standardise the value targets (MAPPO)
     obs_norm: bool = False           # running per-feature scaling of the observation
     penalty_scale: float = 1.0       # one dial on every penalty, see below
+    offroad_indicator: bool = False  # charge off-road once per step, not by depth
+    offroad_terminal: bool = False   # off the map ends that agent's episode
+    w_offroad_event: float = 1.0     # the one-off charge when it does
     proximity_per_type: bool = False # one worst partner per type, summed
     crosswalk_priority: bool = False # a crossing outranks the road that passes through it
     capsule_risk: bool = False       # measure crossing risk from the body, not the centre
@@ -305,6 +308,8 @@ def train(cfg: PPOConfig):
                   offroad_fix=cfg.offroad_fix, capsule_risk=cfg.capsule_risk,
                   proximity_per_type=cfg.proximity_per_type,
                   crosswalk_priority=cfg.crosswalk_priority,
+                  offroad_terminal=cfg.offroad_terminal, w_offroad_event=cfg.w_offroad_event,
+                  offroad_indicator=cfg.offroad_indicator,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
