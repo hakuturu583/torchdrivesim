@@ -126,6 +126,13 @@ class AWSIMDrivingEnv:
     # collision or off-road event). Terminating on top of it is an extrapolation - the
     # nearest published thing is GPUDrive's appendix comparing removing an agent at
     # collision against ignoring it - so the two are separate flags and separate runs.
+    # With the corridor on, the goal was left where it was: one point 150 m along the
+    # original route, worth 0.074 discounted and pulling sideways whenever the route
+    # curved. The corridor already resamples every lane it offers, so hand those points
+    # over as the goals instead - spaced by `goal_dist`, and snapped laterally onto
+    # whichever of the offered lanes the agent is actually in, so changing lane does not
+    # leave the goal behind in the old one.
+    WAYPOINT_GOALS = False
     OFFROAD_INDICATOR = False
     OFFROAD_TERMINAL = False
     OFFROAD_TERMINAL_M = 1.0         # summed corner overhang that counts as off the map
@@ -286,7 +293,10 @@ class AWSIMDrivingEnv:
                  w_follow=None, branch_obs=None, despawn_at_goal=None,
                  terminate_on_teleport=None, offroad_fix=None, capsule_risk=None,
                  proximity_per_type=None, crosswalk_priority=None,
-                 offroad_terminal=None, w_offroad_event=None, offroad_indicator=None):
+                 offroad_terminal=None, w_offroad_event=None, offroad_indicator=None,
+                 waypoint_goals=None):
+        self.waypoint_goals = (self.WAYPOINT_GOALS if waypoint_goals is None
+                               else waypoint_goals)
         self.offroad_indicator = (self.OFFROAD_INDICATOR if offroad_indicator is None
                                   else offroad_indicator)
         self.offroad_terminal = (self.OFFROAD_TERMINAL if offroad_terminal is None
@@ -1302,6 +1312,26 @@ class AWSIMDrivingEnv:
     def _state(self):
         return self.simulator.get_state()[0]  # (A, 4): x, y, psi, v
 
+    def _reanchor_goals(self, state):
+        """Slide each wheeled agent's goal sideways onto the lane it is in.
+
+        The rolling goal lives on the route polyline, which is one particular lane. Once
+        the corridor tells an agent that the lane beside it is equally good, a goal that
+        stays in the original lane is a standing pull back into it - the choice the
+        corridor was built to leave open, taken away by the goal. Snapping it to the
+        nearest point of the current lane keeps how far along it is and drops which lane
+        it is in.
+        """
+        if not self.waypoint_goals:
+            return
+        A = self.num_agents
+        lane = self._agent_lanelet(state)
+        path = self._branch_xy[lane]                                # [A, P, 2]
+        idx = (self.goals.unsqueeze(1) - path).norm(dim=-1).argmin(dim=1)
+        near = path[torch.arange(A, device=self.device), idx]
+        keep = self._branch_types().unsqueeze(1)
+        self.goals = torch.where(keep, near, self.goals)
+
     def _dist_to_goal(self, state):
         return torch.linalg.norm(state[:, :2] - self.goals, dim=-1)  # (A,)
 
@@ -1582,6 +1612,7 @@ class AWSIMDrivingEnv:
         was_reached = self._reached.clone()          # agents that already finished before this step
         self._teleported = torch.zeros(self.num_agents, dtype=torch.bool,
                                        device=self.device)
+        self._reanchor_goals(self._state())
         action = self._limit_steering(action, self._state())
         # parked cars never act: they are scenery the policy has to drive around, and they
         # are excluded from training so their (meaningless) transitions carry no gradient

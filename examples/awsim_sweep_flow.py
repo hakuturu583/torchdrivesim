@@ -43,7 +43,7 @@ BASE = dict(
     w_lanechange=0.0, w_solidcross=0.0, max_steer_scale=1.0, goal_dist_scale=1.0,
     w_follow=0.0, terminate_on_teleport="false", offroad_fix="false",
     proximity_per_type="false", crosswalk_priority="false",
-    offroad_indicator="false", offroad_terminal="false",
+    offroad_indicator="false", offroad_terminal="false", waypoint_goals="false",
     seed=42,
     value_norm="false", penalty_scale=1.0,
     checkpoint_every=50,
@@ -155,6 +155,17 @@ PLANS = {
     # `offroadterm` ends that agent's episode on top, which is an extrapolation from
     # GPUDrive's appendix on removing agents at collision. Cars and motorbikes only: a
     # pedestrian's whole network sits on top of the roads and reads 0.000 off-road.
+    # The corridor, finished. It resamples every lane it offers and then left the goal
+    # 150 m away on the original route - worth 0.074 discounted, and pulling sideways
+    # whenever the route curved. Now the goals are 25 m apart and snap onto whichever
+    # offered lane the agent is in. Read against `corridorfix`, which has the corridor
+    # and the old goal, so the goal is the only difference. The goal *count* rises about
+    # sixfold by construction at 25 m against 150 m - judge it on distance, contacts and
+    # off-road, not on that number.
+    "waypoint": dict(w_follow=0.2, offroad_fix="true", goal_dist_scale=0.1667,
+                     waypoint_goals="true"),
+    "waypoint2": dict(w_follow=0.2, offroad_fix="true", goal_dist_scale=0.1667,
+                      waypoint_goals="true", seed=123),
     "offroadind": dict(offroad_indicator="true"),
     "offroadind2": dict(offroad_indicator="true", seed=123),
     "offroadterm": dict(offroad_terminal="true"),
