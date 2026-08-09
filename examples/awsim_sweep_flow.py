@@ -44,6 +44,11 @@ BASE = dict(
     w_follow=0.0, terminate_on_teleport="false", offroad_fix="false",
     proximity_per_type="false", crosswalk_priority="false",
     offroad_indicator="false", offroad_terminal="false", waypoint_goals="false",
+    collision_indicator="false", collision_terminal="false",
+    # The give-way rule, rebuilt from the road code. Every run from here carries these:
+    # the map's own right_of_way elements leave 380 of 1219 pairs mutual, both sides told
+    # to yield to each other, and the reward has been charging that in every run so far.
+    jp_priority="true", yield_fix="true", yield_first_in="true",
     seed=42,
     value_norm="false", penalty_scale=1.0,
     checkpoint_every=50,
@@ -121,6 +126,7 @@ PLANS = {
     # fixed 100 m / 50 m, which alone took the clamp saturation from 62% to 5%. That
     # moves the baseline, so it needs re-measuring before anything is read against it.
     "base": dict(),
+    "base2": dict(seed=123),
     # The corridor. Instead of a bearing to one point 150 m along one lane, the policy
     # is shown where each lane it may legally be in goes next - its own and the two it
     # could change into - and is paid for ground covered while tracking *any* of them.
@@ -166,6 +172,14 @@ PLANS = {
                      waypoint_goals="true"),
     "waypoint2": dict(w_follow=0.2, offroad_fix="true", goal_dist_scale=0.1667,
                       waypoint_goals="true", seed=123),
+    # A contact charged when it happens, to the one that drove in, instead of as the
+    # rise in overlap smeared over the steps a body takes to sink into another. An
+    # at-fault contact currently works out at 10.06 - two goals - delivered that way,
+    # and a 28 km/h impact costs what a slow scrape does if the final overlap matches.
+    "collisionind": dict(collision_indicator="true"),
+    "collisionind2": dict(collision_indicator="true", seed=123),
+    "collisionterm": dict(collision_terminal="true"),
+    "collisionterm2": dict(collision_terminal="true", seed=123),
     "offroadind": dict(offroad_indicator="true"),
     "offroadind2": dict(offroad_indicator="true", seed=123),
     "offroadterm": dict(offroad_terminal="true"),

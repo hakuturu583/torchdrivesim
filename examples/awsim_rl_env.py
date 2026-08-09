@@ -142,6 +142,31 @@ class AWSIMDrivingEnv:
     # Only the party that drove into the other is charged and removed - being reached
     # while stationary is not something to be punished for, and 36% of contacts have a
     # stationary party.
+    # The map's right_of_way elements declare "this lanelet gives way" one at a time and
+    # nothing checks that a junction is consistent: 380 of the 1219 pairs it produces are
+    # mutual, both directions told to yield to each other. Neither party can move without
+    # breaking the rule, and adding the right-turn rule took it to 524. Mutual pairs are
+    # therefore re-decided from the road code rather than trusted, in this order:
+    #   signalised junction  -> the signal governs, no yield relation at all
+    #   clearly wider road   -> the wider one has priority          (36-2)
+    #   otherwise            -> the one arriving from the left      (36-1, 左方優先)
+    # The left-hand rule is what makes this safe: "j is to my left" and "i is to my left"
+    # cannot both hold, so the result is antisymmetric by construction.
+    # Who you have to give way to, and when. The condition was "somebody with priority
+    # is within YIELD_RADIUS", which fires for traffic behind you, traffic already past
+    # you, and traffic on the far side of a junction - 56% of the violations measured
+    # were agents that had already crossed the stop line and had no way left to yield.
+    # A vehicle you must give way to is one that is ahead of you and closing.
+    # Once you are in the junction you clear it - the obligation to give way is an
+    # obligation not to *enter*. Japanese practice puts the vehicle that entered first
+    # ahead (先入車優先), and the code had it backwards: a car that had already committed
+    # from the minor road was still being charged with failing to yield, while the one
+    # still approaching on the priority road owed it nothing.
+    YIELD_FIRST_IN = False
+    YIELD_FIX = False
+    YIELD_RADIUS_FIXED = 15.0        # m, against the 25 m that reached across a junction
+    JP_PRIORITY = False
+    JP_WIDTH_RATIO = 1.5             # "clearly wider" under 36-2
     COLLISION_INDICATOR = False
     COLLISION_TERMINAL = False
     W_COLLISION_EVENT = 5.0          # one charge, against a goal worth 5
@@ -308,7 +333,12 @@ class AWSIMDrivingEnv:
                  proximity_per_type=None, crosswalk_priority=None,
                  offroad_terminal=None, w_offroad_event=None, offroad_indicator=None,
                  waypoint_goals=None, collision_indicator=None,
-                 collision_terminal=None, w_collision_event=None):
+                 collision_terminal=None, w_collision_event=None, jp_priority=None,
+                 yield_fix=None, yield_first_in=None):
+        self.yield_first_in = (self.YIELD_FIRST_IN if yield_first_in is None
+                               else yield_first_in)
+        self.jp_priority = self.JP_PRIORITY if jp_priority is None else jp_priority
+        self.yield_fix = self.YIELD_FIX if yield_fix is None else yield_fix
         self.collision_indicator = (self.COLLISION_INDICATOR if collision_indicator is
                                     None else collision_indicator)
         self.collision_terminal = (self.COLLISION_TERMINAL if collision_terminal is None
@@ -507,6 +537,12 @@ class AWSIMDrivingEnv:
         self._yield_lanelet = yields
         self._pt_lanelet = torch.tensor([order[ll.id] for ll in lanelets], device=self.device)
         self._add_oncoming_turn_priority()
+        self._resolve_mutual_priority(lanelets)
+        self._junction_lanelet = torch.zeros(len(order), dtype=torch.bool,
+                                             device=self.device)
+        for ll in self.lanelet_map.laneletLayer:
+            if ll.id in order and 'turn_direction' in ll.attributes:
+                self._junction_lanelet[order[ll.id]] = True
         self._build_downstream()
         self._build_lateral()
         self._build_branch_paths()
@@ -737,6 +773,79 @@ class AWSIMDrivingEnv:
                 n += 1
         return n
 
+    def _resolve_mutual_priority(self, lanelets):
+        """Re-decide every pair that was told to yield in both directions.
+
+        See JP_PRIORITY. `yields` is recomputed from the table afterwards so the two
+        cannot drift apart - it was being set by three different places.
+        """
+        P = self._priority
+        if not self.jp_priority:
+            self._yield_lanelet = P.any(dim=1)
+            return
+        order = self._lanelet_order
+        by_idx = {order[ll.id]: ll for ll in lanelets if ll.id in order}
+        head, width, signalised = {}, {}, {}
+        for i, ll in by_idx.items():
+            cl = [(q.x, q.y) for q in ll.centerline]
+            if len(cl) < 2:
+                continue
+            a, b = np.asarray(cl[-2]), np.asarray(cl[-1])
+            head[i] = np.arctan2(b[1] - a[1], b[0] - a[0])
+            width[i] = 2.0 * self._half_width_of(ll)
+            signalised[i] = any(
+                'subtype' in r.attributes and r.attributes['subtype'] == 'traffic_light'
+                for r in ll.regulatoryElements)
+
+        mutual = (P & P.T).nonzero().tolist()
+        pairs = {(min(i, j), max(i, j)) for i, j in mutual if i != j}
+        by_rule = {'signal': 0, 'width': 0, 'left': 0, 'skipped': 0}
+        for i, j in pairs:
+            P[i, j] = False
+            P[j, i] = False
+            if i not in head or j not in head:
+                by_rule['skipped'] += 1
+                continue
+            if signalised.get(i) or signalised.get(j):
+                by_rule['signal'] += 1          # the phase decides; no yield relation
+                continue
+            wi, wj = width[i], width[j]
+            if wi >= self.JP_WIDTH_RATIO * wj:
+                P[j, i] = True                  # i is the wider road, j gives way
+                by_rule['width'] += 1
+            elif wj >= self.JP_WIDTH_RATIO * wi:
+                P[i, j] = True
+                by_rule['width'] += 1
+            else:
+                # cross(h_i, h_j) < 0 means j travels rightwards across i's path, i.e. j
+                # is arriving from i's left and has priority. Driving north with someone
+                # coming from the west: h_i = (0,1), h_j = (1,0), cross = -1.
+                ci, si = np.cos(head[i]), np.sin(head[i])
+                cj, sj = np.cos(head[j]), np.sin(head[j])
+                if ci * sj - si * cj < 0:
+                    P[i, j] = True              # j arrives from i's left
+                else:
+                    P[j, i] = True
+                by_rule['left'] += 1
+        self._priority = P
+        self._yield_lanelet = P.any(dim=1)
+        self._priority_rules = by_rule
+
+    @staticmethod
+    def _half_width_of(ll):
+        """Half the lane width, to the left bound as a polyline rather than its
+        vertices - the bounds here store a straight edge as two distant points."""
+        centre = np.asarray([(q.x, q.y) for q in ll.centerline], dtype=np.float64)
+        left = np.asarray([(q.x, q.y) for q in ll.leftBound], dtype=np.float64)
+        if left.shape[0] < 2 or centre.shape[0] < 1:
+            return 1.5
+        a, b = left[:-1], left[1:]
+        ab = b - a
+        den = (ab * ab).sum(-1).clip(min=1e-9)
+        t = (((centre[:, None, :] - a[None]) * ab[None]).sum(-1) / den).clip(0.0, 1.0)
+        foot = a[None] + t[..., None] * ab[None]
+        return float(np.median(np.linalg.norm(centre[:, None, :] - foot, axis=-1).min(1)))
+
     def _add_oncoming_turn_priority(self):
         """Make right-turning lanelets give way to the oncoming traffic they cross.
 
@@ -839,6 +948,7 @@ class AWSIMDrivingEnv:
             self._sl_offset = torch.zeros(0, dtype=torch.long, device=self.device)
             self._sl_ped = torch.zeros(0, dtype=torch.bool, device=self.device)
             self._sl_allowed = torch.zeros(self.NUM_TYPES, 0, dtype=torch.bool, device=self.device)
+            self._junction_xy = torch.zeros(0, 2, device=self.device)
             return
         sig = np.asarray(sig, dtype=np.float64)
 
@@ -887,6 +997,8 @@ class AWSIMDrivingEnv:
                     np.linalg.norm(sig[crossed, :2] - sig[i, :2], axis=1))]
                 group[i] = 1 - group[nearest]
                 offset[i] = offset[nearest]
+        self._junction_xy = torch.tensor(np.asarray(centres, dtype=np.float64),
+                                         dtype=torch.float32, device=self.device)
         self._sl_xy = torch.tensor(sig[:, :2], dtype=torch.float32, device=self.device)
         self._sl_dir = torch.tensor(sig[:, 2], dtype=torch.float32, device=self.device)
         self._sl_group = torch.tensor(group, device=self.device)
@@ -1153,12 +1265,38 @@ class AWSIMDrivingEnv:
         # priority is close by. A proxy, not a conflict-point calculation - it says
         # "you should have waited", not "you would have hit them".
         lane = self._pt_lanelet[near]
-        close = torch.cdist(state[:, :2], state[:, :2]) < self.YIELD_RADIUS
+        radius = self.YIELD_RADIUS_FIXED if self.yield_fix else self.YIELD_RADIUS
+        rel = state[:, :2].unsqueeze(0) - state[:, :2].unsqueeze(1)      # [A, A, 2] j - i
+        close = rel.norm(dim=-1) < radius
         close.fill_diagonal_(False)
+        if self.yield_fix:
+            c, sn = torch.cos(psi), torch.sin(psi)
+            ahead = rel[..., 0] * c.unsqueeze(1) + rel[..., 1] * sn.unsqueeze(1) > 0
+            v = state[:, 3].unsqueeze(-1)
+            vel = torch.stack([c, sn], dim=-1) * v
+            # closing along the line of centres: the gap is shrinking
+            n = rel / (rel.norm(dim=-1, keepdim=True) + 1e-6)
+            closing = ((vel.unsqueeze(1) - vel.unsqueeze(0)) * n).sum(-1) > 0.0
+            close = close & ahead & closing
         prio = self._priority[lane][:, lane]                     # [A, A] j has priority over i
-        threatened = (close & prio).any(dim=1)
-        failtoyield = (self._yield_lanelet[lane] & threatened
-                       & (state[:, 3].abs() > self.YIELD_SPEED)).float()
+        moving = state[:, 3].abs() > self.YIELD_SPEED
+        if not self.yield_first_in:
+            threatened = (close & prio).any(dim=1)
+            failtoyield = (self._yield_lanelet[lane] & threatened & moving).float()
+        else:
+            # Inside the junction is a question the map already answers: 387 of the 979
+            # lanelets carry a `turn_direction`, and that includes the ones going
+            # straight through (149 of them), so it is the junction area itself rather
+            # than only the turns. A radius cannot do this - 40 m around a stop-line
+            # cluster called a quarter of all agents "inside", counting cars that had
+            # just left one and cars whose next stop line was simply out of range,
+            # against 17.4% by lanelet.
+            inside = self._junction_lanelet[lane]
+            by_prio = self._yield_lanelet[lane] & (close & prio).any(dim=1)
+            # ...and to anyone already in it, whatever the lanelets say
+            by_first = (close & inside.unsqueeze(0)).any(dim=1)
+            failtoyield = ((by_prio | by_first) & moving & ~inside).float()
+            self._inside_junction = inside
         self._excess_kmh = excess * 3.6
         return redlight, wrongway, speeding, failtoyield
 

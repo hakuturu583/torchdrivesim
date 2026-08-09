@@ -99,7 +99,12 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  capsule_risk=None, proximity_per_type=None, crosswalk_priority=None,
                  offroad_terminal=None, w_offroad_event=None, offroad_indicator=None,
                  waypoint_goals=None, collision_indicator=None,
-                 collision_terminal=None, w_collision_event=None):
+                 collision_terminal=None, w_collision_event=None, jp_priority=None,
+                 yield_fix=None, yield_first_in=None):
+        self.yield_first_in = (self.YIELD_FIRST_IN if yield_first_in is None
+                               else yield_first_in)
+        self.jp_priority = self.JP_PRIORITY if jp_priority is None else jp_priority
+        self.yield_fix = self.YIELD_FIX if yield_fix is None else yield_fix
         self.collision_indicator = (self.COLLISION_INDICATOR if collision_indicator is
                                     None else collision_indicator)
         self.collision_terminal = (self.COLLISION_TERMINAL if collision_terminal is None

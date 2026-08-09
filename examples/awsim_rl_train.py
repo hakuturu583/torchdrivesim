@@ -87,6 +87,9 @@ class PPOConfig:
     value_norm: bool = False         # standardise the value targets (MAPPO)
     obs_norm: bool = False           # running per-feature scaling of the observation
     penalty_scale: float = 1.0       # one dial on every penalty, see below
+    yield_first_in: bool = False     # the vehicle already in the junction goes first
+    yield_fix: bool = False          # give way only to what is ahead of you and closing
+    jp_priority: bool = False        # re-decide mutual give-way pairs from the road code
     collision_indicator: bool = False # charge a contact once, at the moment it starts
     collision_terminal: bool = False  # ...and end the at-fault agent's episode
     w_collision_event: float = 5.0    # the size of that charge
@@ -315,6 +318,8 @@ def train(cfg: PPOConfig):
                   offroad_terminal=cfg.offroad_terminal, w_offroad_event=cfg.w_offroad_event,
                   offroad_indicator=cfg.offroad_indicator,
                   waypoint_goals=cfg.waypoint_goals,
+                  jp_priority=cfg.jp_priority, yield_fix=cfg.yield_fix,
+                  yield_first_in=cfg.yield_first_in,
                   collision_indicator=cfg.collision_indicator,
                   collision_terminal=cfg.collision_terminal,
                   w_collision_event=cfg.w_collision_event,
