@@ -203,3 +203,11 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+
+# Downloaded AWSIM / Autoware maps (see examples/AWSIM_RL_HANDOVER.md)
+/nishishinjuku_autoware_map/
+/sample_map.osm
+
+# RL training outputs / wandb
+/awsim_rl_output/
+/wandb/

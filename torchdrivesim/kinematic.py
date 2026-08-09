@@ -187,6 +187,23 @@ class CompoundKinematicModel(KinematicModel):
         return self.model_assignments.flatten()
 
     @property
+    def split_indices(self) -> List[Tensor]:
+        """Integer indices of the batch elements belonging to each model.
+
+        The assignment is static, but `batch_assignments == i` rebuilt it as a boolean
+        mask on every step, set_state and get_state. Boolean-mask indexing has to read
+        the selection count back from the device, so those three lines alone cost ~17
+        synchronisations per simulator step - more than half of all of them - and each
+        one drains the CUDA queue. Integer indices do not synchronise, and they are
+        cached until the assignment itself changes.
+        """
+        a = self.batch_assignments
+        if getattr(self, '_split_cache_key', None) != (a.data_ptr(), a.shape[0], len(self.models)):
+            self._split_cache = [(a == i).nonzero(as_tuple=True)[0] for i in range(len(self.models))]
+            self._split_cache_key = (a.data_ptr(), a.shape[0], len(self.models))
+        return self._split_cache
+
+    @property
     def batch_size(self) -> int:
         return len(self.batch_assignments)
     
@@ -196,7 +213,8 @@ class CompoundKinematicModel(KinematicModel):
 
     def step(self, action: Tensor, dt: Optional[float] = None) -> None:
         action_flattened = action.flatten(0, -2)
-        action_splits = [action_flattened[self.batch_assignments == i, :model.action_size] for (i, model) in enumerate(self.models)]
+        action_splits = [action_flattened[idx, :model.action_size]
+                         for idx, model in zip(self.split_indices, self.models)]
         for model, action_split in zip(self.models, action_splits):
             model.step(action_split, dt=dt)
 
@@ -245,7 +263,8 @@ class CompoundKinematicModel(KinematicModel):
 
     def set_state(self, state: Tensor) -> None:
         state_flattened = state.flatten(0, -2)
-        state_splits = [state_flattened[self.batch_assignments == i, :model.state_size] for (i, model) in enumerate(self.models)]
+        state_splits = [state_flattened[idx, :model.state_size]
+                        for idx, model in zip(self.split_indices, self.models)]
         for model, state_split in zip(self.models, state_splits):
             model.set_state(state_split)
 
@@ -253,8 +272,8 @@ class CompoundKinematicModel(KinematicModel):
         state_splits = [model.get_state() for model in self.models]
         padded_state_splits = [torch.nn.functional.pad(s, (0, self.state_size - s.shape[-1])) for s in state_splits]
         state_flattened = torch.zeros_like(torch.cat(padded_state_splits, dim=0))
-        for i, state_split in enumerate(padded_state_splits):
-            state_flattened[self.batch_assignments == i] = state_split
+        for idx, state_split in zip(self.split_indices, padded_state_splits):
+            state_flattened.index_copy_(0, idx, state_split)
         state = state_flattened.reshape(self.batch_shape + (self.state_size,))
         return state
 
@@ -293,7 +312,8 @@ class CompoundKinematicModel(KinematicModel):
 
     def normalize_action(self, action: Tensor) -> Tensor:
         action_flattened = action.flatten(0, -2)
-        action_splits = [action_flattened[self.batch_assignments == i, :model.action_size] for (i, model) in enumerate(self.models)]
+        action_splits = [action_flattened[idx, :model.action_size]
+                         for idx, model in zip(self.split_indices, self.models)]
         normalized_action_splits = [model.normalize_action(a) for model, a in zip(self.models, action_splits)]
         padded_normalized_action_splits = [torch.nn.functional.pad(a, (0, self.action_size - a.shape[-1])) for a in normalized_action_splits]
         normalized_action_flattened = torch.zeros_like(torch.cat(padded_normalized_action_splits, dim=0))
@@ -304,7 +324,8 @@ class CompoundKinematicModel(KinematicModel):
 
     def denormalize_action(self, action: Tensor) -> Tensor:
         action_flattened = action.flatten(0, -2)
-        action_splits = [action_flattened[self.batch_assignments == i, :model.action_size] for (i, model) in enumerate(self.models)]
+        action_splits = [action_flattened[idx, :model.action_size]
+                         for idx, model in zip(self.split_indices, self.models)]
         denormalized_action_splits = [model.denormalize_action(a) for model, a in zip(self.models, action_splits)]
         padded_denormalized_action_splits = [torch.nn.functional.pad(a, (0, self.action_size - a.shape[-1])) for a in denormalized_action_splits]
         denormalized_action_flattened = torch.zeros_like(torch.cat(padded_denormalized_action_splits, dim=0))

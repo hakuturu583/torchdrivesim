@@ -1,0 +1,17 @@
+# Extra dependencies for the AWSIM / Autoware examples and RL scaffold.
+# torch is intentionally NOT pinned here: install the build matching your CUDA
+# (see the project README) before installing this file.
+#
+#   pip install -r examples/requirements-awsim.txt
+#
+lanelet2>=1.2.3          # Lanelet2 Python bindings (no ROS needed)
+numpy
+scipy
+opencv-python-headless   # cv2 renderer (CPU); use pytorch3d/nvdiffrast for faster GPU rendering
+omegaconf                # dot-list CLI config in the example scripts
+shapely                  # required by torchdrivesim.infractions
+imageio
+imageio-ffmpeg           # mp4 video output (save_video)
+matplotlib               # reward-curve plot in awsim_rl_train.py (optional)
+wandb                    # metrics logging (awsim_rl_train.py wandb=true; imported only then)
+pytest                   # examples/tests smoke tests

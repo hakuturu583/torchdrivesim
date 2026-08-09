@@ -153,10 +153,12 @@ def point_to_mesh_distance_pt(points: torch.Tensor, tris: torch.Tensor, threshol
         p_proj = v0 + tt * v1v0
         dist = ((p - p_proj)[..., None, :] @ (p - p_proj)[..., :, None]).squeeze(-1)
 
+        # branchless: the `if small_dist.any()` guard that used to be here read the
+        # device on every call, three times per point-to-mesh distance, and the blend it
+        # was skipping costs far less than the synchronisation did
         small_dist = (l2 <= 1e-8).to(l2.dtype)
-        if small_dist.any():
-            dist = dist * (1 - small_dist) + ((p - v1)[..., None, :] @ (p - v1)[..., :, None]).squeeze(-1) * small_dist
-        return dist
+        degenerate = ((p - v1)[..., None, :] @ (p - v1)[..., :, None]).squeeze(-1)
+        return dist * (1 - small_dist) + degenerate * small_dist
 
     e01 = point_line_distance(p, v0, v1)
     e02 = point_line_distance(p, v0, v2)

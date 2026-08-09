@@ -85,13 +85,44 @@ class LaneletError(RuntimeError):
     pass
 
 
-def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0)) -> LaneletMap:
+def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0),
+                     robust: bool = False, use_local_coordinates: bool = False,
+                     recenter: bool = False, projector: Optional[Any] = None) -> LaneletMap:
     """
     Load a Lanelet2 map from an OSM file on disk.
 
     Args:
         map_path: local path to OSM file containing the map
-        origin: latitude and longitude of the origin to use with UTM projector
+        origin: latitude and longitude of the origin to use with UTM projector.
+            For geo-referenced maps (e.g. AWSIM/Autoware exports around a real
+            location), set this to a point inside the map so the correct UTM
+            zone is selected; the default (0, 0) only works for maps whose
+            coordinates are already centered near the equator/prime meridian.
+            Ignored when ``use_local_coordinates`` is used and all nodes carry
+            ``local_x``/``local_y`` tags, or when an explicit ``projector`` is
+            passed with its own origin.
+        robust: if True, use ``loadRobust`` so that primitives the upstream
+            parser cannot interpret (such as Autoware-specific regulatory
+            elements like ``detection_area`` or ``virtual_traffic_light``) are
+            skipped instead of aborting the whole load. The road/lane geometry
+            is still loaded, which is what TorchDriveSim needs.
+        use_local_coordinates: for Autoware / Vector Map Builder maps, use the
+            ``local_x``/``local_y`` node tags as the metric coordinates. This
+            reproduces what Autoware's own OSM parser (and its MGRS projector)
+            does: the geo-referenced lat/lon is only used to pick the UTM zone,
+            while the authoritative planar coordinates come from the local tags.
+            Falls back to the plain UTM projection for any node lacking them.
+            Because Autoware writes the MGRS-projected values into those tags,
+            this yields the same coordinates as Autoware's ``MGRSProjector``
+            without needing the native ``lanelet2_extension_python`` build.
+        recenter: subtract the mean node position so the map is centered on the
+            origin. Useful with ``use_local_coordinates`` because Autoware local
+            coordinates are large MGRS-relative offsets (tens of thousands of
+            metres) that hurt float precision and camera placement.
+        projector: an explicit lanelet2 projector to use instead of the default
+            UTM projector. Pass Autoware's projector here when it is available,
+            e.g. ``from lanelet2_extension_python.projection import MGRSProjector;
+            load_lanelet_map(path, projector=MGRSProjector(Origin(lat, lon)))``.
     Raises:
         Lanelet2NotFound: if lanelet2 package is not available
         FileNotFoundError: if specified file doesn't exist
@@ -100,8 +131,30 @@ def load_lanelet_map(map_path: str, origin: Tuple[float, float] = (0, 0)) -> Lan
         raise Lanelet2NotFound()
     if not os.path.exists(map_path):
         raise FileNotFoundError(map_path)
-    projector = lanelet2.projection.UtmProjector(lanelet2.io.Origin(*origin))
-    lanelet_map = lanelet2.io.load(map_path, projector)
+    if projector is None:
+        projector = lanelet2.projection.UtmProjector(lanelet2.io.Origin(*origin))
+    if robust or use_local_coordinates:
+        lanelet_map, load_errors = lanelet2.io.loadRobust(map_path, projector)
+        if load_errors:
+            logger.debug(f"load_lanelet_map skipped {len(load_errors)} unparsable primitive(s) in {map_path}")
+    else:
+        lanelet_map = lanelet2.io.load(map_path, projector)
+
+    if use_local_coordinates:
+        for point in lanelet_map.pointLayer:
+            if 'local_x' in point.attributes and 'local_y' in point.attributes:
+                point.x = float(point.attributes['local_x'])
+                point.y = float(point.attributes['local_y'])
+
+    if recenter:
+        xs = [p.x for p in lanelet_map.pointLayer]
+        ys = [p.y for p in lanelet_map.pointLayer]
+        if xs:
+            cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+            for point in lanelet_map.pointLayer:
+                point.x -= cx
+                point.y -= cy
+
     return lanelet_map
 
 
