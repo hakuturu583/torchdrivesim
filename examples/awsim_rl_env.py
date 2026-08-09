@@ -1330,6 +1330,18 @@ class AWSIMDrivingEnv:
     # distance computation but restrict it to the OFFROAD_FACES nearest faces
     # (by face centroid), which is a superset of the candidates by a wide margin.
     OFFROAD_FACES = 128
+    # Ranking all 113k faces by their lower bound every step costs a [A, 113005] cdist
+    # and a topk over it, 7 of the off-road term's 14 ms. A grid over face centroids
+    # cannot simply be keyed on the centroid: faces here run up to 118.9 m across, and
+    # the whole reason the ranking uses `centroid distance - circumradius` is that a big
+    # face can be nearest while its centroid is far. So each face is registered to every
+    # cell within its own radius plus GRID_MARGIN, and the lookup carries a certificate:
+    # if the 128th smallest bound among the cell's faces is within GRID_MARGIN, then no
+    # face outside the cell can beat it, and the answer is exactly the dense one. Agents
+    # that fail the certificate - deep off-road, where the nearest face is far - fall
+    # back to the full scan.
+    GRID_CELL = 25.0
+    GRID_MARGIN = 20.0
 
     def _build_offroad_index(self):
         verts = self.mesh.verts[0][..., :2]                            # [V, 2]
@@ -1343,6 +1355,52 @@ class AWSIMDrivingEnv:
         # small ones.
         self._face_radius = (tris - self._face_centroid.unsqueeze(-2)).norm(dim=-1).max(dim=-1).values
         self._offroad_k = min(self.OFFROAD_FACES, faces.shape[0])
+        self._build_face_grid()
+
+    def _build_face_grid(self):
+        """Bucket faces into a uniform grid, each into every cell it could be nearest
+        from. See GRID_CELL / GRID_MARGIN."""
+        c = self._face_centroid.cpu().numpy().astype(np.float64)
+        rad = self._face_radius.cpu().numpy().astype(np.float64)
+        cell, margin = self.GRID_CELL, self.GRID_MARGIN
+        lo = c.min(axis=0) - 1.0
+        nx = int(np.ceil((c[:, 0].max() - lo[0]) / cell)) + 1
+        ny = int(np.ceil((c[:, 1].max() - lo[1]) / cell)) + 1
+        reach = rad + margin
+        g0 = np.floor((c - reach[:, None] - lo) / cell).astype(np.int64)
+        g1 = np.floor((c + reach[:, None] - lo) / cell).astype(np.int64)
+        np.clip(g0[:, 0], 0, nx - 1, out=g0[:, 0]); np.clip(g1[:, 0], 0, nx - 1, out=g1[:, 0])
+        np.clip(g0[:, 1], 0, ny - 1, out=g0[:, 1]); np.clip(g1[:, 1], 0, ny - 1, out=g1[:, 1])
+        buckets = [[] for _ in range(nx * ny)]
+        for f in range(c.shape[0]):
+            for gx in range(g0[f, 0], g1[f, 0] + 1):
+                for gy in range(g0[f, 1], g1[f, 1] + 1):
+                    buckets[gx * ny + gy].append(f)
+        cap = max(len(b) for b in buckets)
+        table = np.full((nx * ny, cap), -1, dtype=np.int64)
+        for k, b in enumerate(buckets):
+            if b:
+                table[k, :len(b)] = b
+        self._grid_lo = torch.tensor(lo, dtype=torch.float32, device=self.device)
+        self._grid_nx, self._grid_ny, self._grid_cap = nx, ny, cap
+        self._grid_faces = torch.tensor(table, device=self.device)
+
+    def _grid_candidates(self, xy, K):
+        """K nearest faces by lower bound, and whether that is provably the true K."""
+        gx = ((xy[:, 0] - self._grid_lo[0]) / self.GRID_CELL).floor().long()
+        gy = ((xy[:, 1] - self._grid_lo[1]) / self.GRID_CELL).floor().long()
+        inside = (gx >= 0) & (gx < self._grid_nx) & (gy >= 0) & (gy < self._grid_ny)
+        cell = (gx.clamp(0, self._grid_nx - 1) * self._grid_ny
+                + gy.clamp(0, self._grid_ny - 1))
+        cand = self._grid_faces[cell]                                  # [A, cap]
+        valid = cand >= 0
+        c = self._face_centroid[cand.clamp(min=0)]
+        bound = (c - xy.unsqueeze(1)).norm(dim=-1) - self._face_radius[cand.clamp(min=0)]
+        bound = torch.where(valid, bound, torch.full_like(bound, float('inf')))
+        best, pos = bound.topk(K, dim=-1, largest=False)
+        # certificate: everything outside this cell has a bound above GRID_MARGIN
+        ok = inside & (best[:, -1] <= self.GRID_MARGIN)
+        return torch.gather(cand, 1, pos), ok
 
     def _offroad(self, state):
         """Per-agent offroad loss, equivalent to `simulator.compute_offroad()[0]`."""
@@ -1350,9 +1408,12 @@ class AWSIMDrivingEnv:
         lenwid = self.simulator.get_agent_size()[0][..., :2]           # [A, 2]
         rect = torch.cat([state[:, :2], lenwid, state[:, 2:3]], dim=-1)
         corners = box2corners_th(rect.unsqueeze(0))[0]                 # [A, 4, 2]
-        # candidate faces: the K nearest by centroid to the agent centre
-        d = torch.cdist(state[:, :2], self._face_centroid) - self._face_radius
-        idx = d.topk(K, dim=-1, largest=False).indices                 # [A, K]
+        # candidate faces: the K nearest by lower bound, from the agent's grid cell
+        idx, ok = self._grid_candidates(state[:, :2], K)
+        if not bool(ok.all()):        # deep off-road: nothing near enough to certify
+            miss = (~ok).nonzero(as_tuple=True)[0]
+            d = torch.cdist(state[miss, :2], self._face_centroid) - self._face_radius
+            idx[miss] = d.topk(K, dim=-1, largest=False).indices
         tris = self._face_tris[idx]                                    # [A, K, 3, 3]
         thr = self.simulator.cfg.offroad_threshold
         # A corner inside one of the candidate triangles is at distance zero, and the
