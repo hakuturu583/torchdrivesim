@@ -87,6 +87,9 @@ class PPOConfig:
     value_norm: bool = False         # standardise the value targets (MAPPO)
     obs_norm: bool = False           # running per-feature scaling of the observation
     penalty_scale: float = 1.0       # one dial on every penalty, see below
+    collision_indicator: bool = False # charge a contact once, at the moment it starts
+    collision_terminal: bool = False  # ...and end the at-fault agent's episode
+    w_collision_event: float = 5.0    # the size of that charge
     waypoint_goals: bool = False     # the corridor's own points become the goals
     offroad_indicator: bool = False  # charge off-road once per step, not by depth
     offroad_terminal: bool = False   # off the map ends that agent's episode
@@ -312,6 +315,9 @@ def train(cfg: PPOConfig):
                   offroad_terminal=cfg.offroad_terminal, w_offroad_event=cfg.w_offroad_event,
                   offroad_indicator=cfg.offroad_indicator,
                   waypoint_goals=cfg.waypoint_goals,
+                  collision_indicator=cfg.collision_indicator,
+                  collision_terminal=cfg.collision_terminal,
+                  w_collision_event=cfg.w_collision_event,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,

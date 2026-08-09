@@ -132,6 +132,19 @@ class AWSIMDrivingEnv:
     # over as the goals instead - spaced by `goal_dist`, and snapped laterally onto
     # whichever of the offered lanes the agent is actually in, so changing lane does not
     # leave the goal behind in the old one.
+    # A collision is an event, not a depth. Every paper read for this charges an
+    # indicator - GPUDrive and Emerge-Lab at -0.5, arXiv:2606.19370 at -1 - while this
+    # charges the rise in geometric overlap every step, so hitting something small costs
+    # less than hitting something big and a slow scrape costs the same as a 28 km/h
+    # impact. `collision_indicator` charges once at the moment of contact;
+    # `collision_terminal` ends that agent's episode on top, which is the option
+    # GPUDrive compares in its appendix and reports as a trade-off rather than a win.
+    # Only the party that drove into the other is charged and removed - being reached
+    # while stationary is not something to be punished for, and 36% of contacts have a
+    # stationary party.
+    COLLISION_INDICATOR = False
+    COLLISION_TERMINAL = False
+    W_COLLISION_EVENT = 5.0          # one charge, against a goal worth 5
     WAYPOINT_GOALS = False
     OFFROAD_INDICATOR = False
     OFFROAD_TERMINAL = False
@@ -294,7 +307,14 @@ class AWSIMDrivingEnv:
                  terminate_on_teleport=None, offroad_fix=None, capsule_risk=None,
                  proximity_per_type=None, crosswalk_priority=None,
                  offroad_terminal=None, w_offroad_event=None, offroad_indicator=None,
-                 waypoint_goals=None):
+                 waypoint_goals=None, collision_indicator=None,
+                 collision_terminal=None, w_collision_event=None):
+        self.collision_indicator = (self.COLLISION_INDICATOR if collision_indicator is
+                                    None else collision_indicator)
+        self.collision_terminal = (self.COLLISION_TERMINAL if collision_terminal is None
+                                   else collision_terminal)
+        self.w_collision_event = (self.W_COLLISION_EVENT if w_collision_event is None
+                                  else w_collision_event)
         self.waypoint_goals = (self.WAYPOINT_GOALS if waypoint_goals is None
                                else waypoint_goals)
         self.offroad_indicator = (self.OFFROAD_INDICATOR if offroad_indicator is None
@@ -1222,6 +1242,8 @@ class AWSIMDrivingEnv:
         new = pairs & ~self._prev_pairs
         self._prev_pairs = pairs
         if not bool(new.any()):
+            self._at_fault_mask = torch.zeros(state.shape[0], dtype=torch.bool,
+                                              device=self.device)
             return torch.zeros(state.shape[0], device=self.device)
         xy, psi, v = state[:, :2], state[:, 2], state[:, 3]
         rel = xy.unsqueeze(0) - xy.unsqueeze(1)                    # [A, A, 2] j - i
@@ -1229,7 +1251,9 @@ class AWSIMDrivingEnv:
         vel = torch.stack([torch.cos(psi), torch.sin(psi)], dim=-1) * v.unsqueeze(-1)
         toward_j = (vel.unsqueeze(1) * n).sum(-1)                  # i closing on j
         toward_i = (vel.unsqueeze(0) * -n).sum(-1)                 # j closing on i
-        return (new & (toward_j >= toward_i)).float().sum(dim=1)
+        fault = new & (toward_j >= toward_i)
+        self._at_fault_mask = fault.any(dim=1)
+        return fault.float().sum(dim=1)
 
     def _collision_weight(self):
         """[A] multiplier for hitting each agent. One road-user type here, so uniform."""
@@ -1656,6 +1680,11 @@ class AWSIMDrivingEnv:
         # it integrates to how deep the agent drove in, and backing out is free.
         hit = (collision - self._prev_collision).clamp(min=0.0) * (~self._just_moved)
         self._prev_collision, self._just_moved = collision, torch.zeros_like(self._just_moved)
+        if self.collision_indicator or self.collision_terminal:
+            # one charge for the agent that drove in, scaled so w_collision still reads
+            # as the dial for it
+            hit = (self._at_fault_mask.float()
+                   * (self.w_collision_event / max(self.w_collision, 1e-9)))
         newly_reached = (dist < self.goal_radius) & (~was_reached)
         # Forward motion is paid for either by closing on a goal point, or - when
         # w_follow is on - by covering ground while tracking one of the branches. The
@@ -1692,6 +1721,9 @@ class AWSIMDrivingEnv:
             lost = self._off_run >= self.OFFROAD_PATIENCE
         # one fused read for the three rare events below, instead of one each
         flags = torch.stack([lost.any(), newly_reached.any()]).tolist()
+        if self.collision_terminal:
+            lost = lost | self._at_fault_mask
+            flags[0] = bool(lost.any())
         if self.rolling_goals and flags[0]:
             if self._recover(lost):
                 state = self._state()
@@ -1727,7 +1759,7 @@ class AWSIMDrivingEnv:
         self._prev_dist = dist
         self._prev_action = action
         done = self._reached.clone() | (self._t >= self.max_steps)
-        if self.terminate_on_teleport or self.offroad_terminal:
+        if self.terminate_on_teleport or self.offroad_terminal or self.collision_terminal:
             done = done | self._teleported
         # `active` marks transitions that count for training: an agent's steps are
         # valid up to and including the step it reaches the goal, then excluded.

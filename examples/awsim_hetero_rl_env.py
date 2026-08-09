@@ -98,7 +98,14 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  despawn_at_goal=None, terminate_on_teleport=None, offroad_fix=None,
                  capsule_risk=None, proximity_per_type=None, crosswalk_priority=None,
                  offroad_terminal=None, w_offroad_event=None, offroad_indicator=None,
-                 waypoint_goals=None):
+                 waypoint_goals=None, collision_indicator=None,
+                 collision_terminal=None, w_collision_event=None):
+        self.collision_indicator = (self.COLLISION_INDICATOR if collision_indicator is
+                                    None else collision_indicator)
+        self.collision_terminal = (self.COLLISION_TERMINAL if collision_terminal is None
+                                   else collision_terminal)
+        self.w_collision_event = (self.W_COLLISION_EVENT if w_collision_event is None
+                                  else w_collision_event)
         self.waypoint_goals = (self.WAYPOINT_GOALS if waypoint_goals is None
                                else waypoint_goals)
         self.offroad_indicator = (self.OFFROAD_INDICATOR if offroad_indicator is None
