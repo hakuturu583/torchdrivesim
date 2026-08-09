@@ -41,7 +41,7 @@ BASE = dict(
     w_proximity=0.1, ttc_threshold=3.0, w_lane=0.4,
     w_collision_level=0.0, lat_accel_max=4.0,
     w_lanechange=0.0, w_solidcross=0.0, max_steer_scale=1.0, goal_dist_scale=1.0,
-    w_follow=0.0, terminate_on_teleport="false",
+    w_follow=0.0, terminate_on_teleport="false", offroad_fix="false",
     seed=42,
     value_norm="false", penalty_scale=1.0,
     checkpoint_every=50,
@@ -133,8 +133,22 @@ PLANS = {
     # 1040 transitions an episode, and they are the ones that matter most. Terminating
     # them makes the last goal a real boundary for that agent, after which it starts
     # again from a freshly drawn spawn point.
+    # `_offroad` is metres of overhang, not an indicator, and `progress * (1 - offroad)`
+    # reversed the sign of the progress reward on 72% of off-road steps - median
+    # multiplier -1.07, mean -9.5. Off the road, an agent was paid to stop and paid to
+    # stay. Withhold the credit instead of reversing it, and cap the penalty, which was
+    # running at 1.24 a step against a forward incentive of 0.095.
+    "offroadfix": dict(offroad_fix="true"),
+    "offroadfix2": dict(offroad_fix="true", seed=123),
     "teledone": dict(terminate_on_teleport="true"),
     "teledone2": dict(terminate_on_teleport="true", seed=123),
+    # The corridor again, with the off-road withholding that its reward path never had.
+    # `w_follow` replaces `progress` for wheeled agents and nothing gated it on being on
+    # the road, so a car off the map still collected the follow reward in full - which
+    # is the obvious candidate for why `lost` tripled, 24 -> 66/86, in the first attempt.
+    # Read against `offroadfix`, not `base`, so the corridor is the only difference.
+    "corridorfix": dict(w_follow=0.2, offroad_fix="true"),
+    "corridorfix2": dict(w_follow=0.2, offroad_fix="true", seed=123),
     "corridor": dict(w_follow=0.2),
     "corridor2": dict(w_follow=0.2, seed=123),
     # "Always use observation normalization" (arXiv:2006.05990). Scale only, no

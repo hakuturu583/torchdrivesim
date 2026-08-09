@@ -85,6 +85,16 @@ class AWSIMDrivingEnv:
     # transition makes the last goal a real episode boundary for that agent, after which
     # it starts again from a freshly drawn spawn point.
     TERMINATE_ON_TELEPORT = False
+    # `_offroad` returns metres - the summed distance of the four corners past the edge -
+    # not an indicator, and two places treated it as one. `progress * (1 - offroad)` was
+    # meant to withhold credit off-road; with a magnitude it *reverses* the sign, and
+    # measured on a trained policy 72% of off-road steps came out with a negative
+    # multiplier, median -1.07 and mean -9.5. An agent off the road was paid to stop, and
+    # paid to stay off, which is why excursions ran long enough to trip the lost counter.
+    # The penalty side was unbounded for the same reason: 0.6 x a median 2.07 is 1.24 a
+    # step against a forward incentive of 0.095, and the 90th percentile is 25.
+    OFFROAD_FIX = False
+    OFFROAD_CAP = 1.0                # metres of overhang past which it costs no more
     MAX_PARTNERS = 16         # K nearest neighbours observed
     PARTNER_FEATURES = 8      # rel_x/y, width, length, rel_head_cos/sin, rel_speed, has_priority
     # 30 m was shorter than the braking distance of the faster agents: a motorcycle at
@@ -239,7 +249,8 @@ class AWSIMDrivingEnv:
                  w_collision_level=None, lat_accel_max=None,
                  w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
                  w_follow=None, branch_obs=None, despawn_at_goal=None,
-                 terminate_on_teleport=None):
+                 terminate_on_teleport=None, offroad_fix=None):
+        self.offroad_fix = self.OFFROAD_FIX if offroad_fix is None else offroad_fix
         self.terminate_on_teleport = (self.TERMINATE_ON_TELEPORT
                                       if terminate_on_teleport is None
                                       else terminate_on_teleport)
@@ -1471,7 +1482,12 @@ class AWSIMDrivingEnv:
         collision = (self._collision(state) > 0).float()
         offroad = (self._offroad(state) > 0).float()
         proximity = self._proximity(state)
-        progress = progress * (1.0 - offroad)      # no credit for shortcutting off-road
+        if self.offroad_fix:
+            off_cost = offroad.clamp(max=self.OFFROAD_CAP)
+            progress = progress * (offroad <= 0).float()   # withheld, never reversed
+        else:
+            off_cost = offroad
+            progress = progress * (1.0 - offroad)  # no credit for shortcutting off-road
         redlight, wrongway, speeding, failtoyield = self._rule_violations(state)
         lane = self._lane_offset(state)
         at_fault = self._at_fault(state)
@@ -1490,8 +1506,13 @@ class AWSIMDrivingEnv:
         # the first one tell a car in lane to head sideways.
         if self.w_follow > 0:
             info_follow = self._follow_score(state)
-            forward = torch.where(self._branch_types(),
-                                  self.w_follow * state[:, 3].abs() * self.dt * info_follow,
+            follow_term = self.w_follow * state[:, 3].abs() * self.dt * info_follow
+            if self.offroad_fix:
+                # the same withholding `progress` gets. Without it the follow reward is
+                # paid in full off the road, which is the one path the off-road term
+                # never reached - and the corridor run's `lost` went 24 -> 66/86.
+                follow_term = follow_term * (offroad <= 0).float()
+            forward = torch.where(self._branch_types(), follow_term,
                                   self.w_progress * progress)
         else:
             info_follow = torch.zeros_like(progress)
@@ -1499,7 +1520,7 @@ class AWSIMDrivingEnv:
         reward = (forward - self.w_collision * hit
                   - self.w_collision_level * collision
                   - self.w_lanechange * chg_legal - self.w_solidcross * chg_solid
-                  - self.w_offroad * offroad + self.w_goal * newly_reached.float()
+                  - self.w_offroad * off_cost + self.w_goal * newly_reached.float()
                   - self.w_redlight * redlight - self.w_wrongway * wrongway
                   - self.w_speeding * speeding            # see W_SPEEDING
                   - self.w_yield * failtoyield - self.w_proximity * proximity
@@ -1579,7 +1600,10 @@ class AWSIMDrivingEnv:
             # `contact` is what the reward now charges
             'collision': mean_active(collision),
             'contact': mean_active(hit),
+            # `offroad` is metres of overhang, which reads nothing like a rate; both are
+            # reported now because the two have been confused for each other
             'offroad': mean_active(offroad),
+            'offroad_rate': mean_active((offroad > 0).float()),
             'lane': mean_active(lane),
             'follow': mean_active(info_follow),
             'atfault': at_fault.sum(),        # contacts this agent drove into, per step

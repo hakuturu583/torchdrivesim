@@ -95,7 +95,8 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  w_collision_level=None, lat_accel_max=None,
                  w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
                  goal_dist_scale=1.0, w_follow=None, branch_obs=None,
-                 despawn_at_goal=None, terminate_on_teleport=None):
+                 despawn_at_goal=None, terminate_on_teleport=None, offroad_fix=None):
+        self.offroad_fix = self.OFFROAD_FIX if offroad_fix is None else offroad_fix
         self.terminate_on_teleport = (self.TERMINATE_ON_TELEPORT
                                       if terminate_on_teleport is None
                                       else terminate_on_teleport)

@@ -87,6 +87,7 @@ class PPOConfig:
     value_norm: bool = False         # standardise the value targets (MAPPO)
     obs_norm: bool = False           # running per-feature scaling of the observation
     penalty_scale: float = 1.0       # one dial on every penalty, see below
+    offroad_fix: bool = False        # withhold progress off-road instead of reversing it
     terminate_on_teleport: bool = False   # a respawn ends that agent's episode
     despawn_at_goal: bool = False    # the last goal ends that agent's episode
     branch_obs: bool = False         # add the branch preview to the observation
@@ -298,6 +299,7 @@ def train(cfg: PPOConfig):
                   w_follow=cfg.w_follow, branch_obs=cfg.branch_obs,
                   despawn_at_goal=cfg.despawn_at_goal,
                   terminate_on_teleport=cfg.terminate_on_teleport,
+                  offroad_fix=cfg.offroad_fix,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,
@@ -350,7 +352,7 @@ def train(cfg: PPOConfig):
         # infraction rates are averaged over the whole rollout.
         ep_reached, ep_reached_type, ep_goals, ep_lost = [], {}, [], []
         step_speed = []
-        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': [], 'lanechange': [], 'solidcross': [], 'atfault': [], 'follow': [], 'present': []}
+        step_coll, step_off, step_rule = [], [], {'redlight': [], 'wrongway': [], 'speeding': [], 'speed_excess': [], 'failtoyield': [], 'proximity': [], 'lane': [], 'contact': [], 'lanechange': [], 'solidcross': [], 'atfault': [], 'follow': [], 'present': [], 'offroad_rate': []}
 
         for t in range(cfg.rollout_steps):
             with torch.no_grad():
