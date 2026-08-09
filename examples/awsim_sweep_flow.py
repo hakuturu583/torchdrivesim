@@ -42,6 +42,7 @@ BASE = dict(
     w_collision_level=0.0, lat_accel_max=4.0,
     w_lanechange=0.0, w_solidcross=0.0, max_steer_scale=1.0, goal_dist_scale=1.0,
     w_follow=0.0, terminate_on_teleport="false", offroad_fix="false",
+    proximity_per_type="false", crosswalk_priority="false",
     seed=42,
     value_norm="false", penalty_scale=1.0,
     checkpoint_every=50,
@@ -138,6 +139,21 @@ PLANS = {
     # multiplier -1.07, mean -9.5. Off the road, an agent was paid to stop and paid to
     # stay. Withhold the credit instead of reversing it, and cap the penalty, which was
     # running at 1.24 a step against a forward incentive of 0.095.
+    # Pedestrians. A car reaches one 154 times an episode, 0.81 per car per 25 s, and
+    # neither of the two things that should stop it was working. The proximity term took
+    # the worst partner over all of them, so a pedestrian was hidden behind the car in
+    # front - 48% of a vehicle's partners classify as crossing and 30% of those are
+    # pedestrians, none of it reaching the reward. And `failtoyield` could not fire for a
+    # pedestrian at all: the map relates road lanelets to each other and the crosswalk
+    # conflict was left unmodelled, so driving through an occupied crossing broke no rule.
+    # Measured on the trained policy: per-type proximity 0.113 -> 0.121, and give-way
+    # lanelets 254 -> 379 taking the failure-to-yield rate 0.046 -> 0.118.
+    "vru": dict(proximity_per_type="true"),
+    "vru2": dict(proximity_per_type="true", seed=123),
+    "crosswalk": dict(crosswalk_priority="true"),
+    "crosswalk2": dict(crosswalk_priority="true", seed=123),
+    "vruboth": dict(proximity_per_type="true", crosswalk_priority="true"),
+    "vruboth2": dict(proximity_per_type="true", crosswalk_priority="true", seed=123),
     "offroadfix": dict(offroad_fix="true"),
     "offroadfix2": dict(offroad_fix="true", seed=123),
     "teledone": dict(terminate_on_teleport="true"),

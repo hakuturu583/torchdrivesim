@@ -87,6 +87,9 @@ class PPOConfig:
     value_norm: bool = False         # standardise the value targets (MAPPO)
     obs_norm: bool = False           # running per-feature scaling of the observation
     penalty_scale: float = 1.0       # one dial on every penalty, see below
+    proximity_per_type: bool = False # one worst partner per type, summed
+    crosswalk_priority: bool = False # a crossing outranks the road that passes through it
+    capsule_risk: bool = False       # measure crossing risk from the body, not the centre
     offroad_fix: bool = False        # withhold progress off-road instead of reversing it
     terminate_on_teleport: bool = False   # a respawn ends that agent's episode
     despawn_at_goal: bool = False    # the last goal ends that agent's episode
@@ -299,7 +302,9 @@ def train(cfg: PPOConfig):
                   w_follow=cfg.w_follow, branch_obs=cfg.branch_obs,
                   despawn_at_goal=cfg.despawn_at_goal,
                   terminate_on_teleport=cfg.terminate_on_teleport,
-                  offroad_fix=cfg.offroad_fix,
+                  offroad_fix=cfg.offroad_fix, capsule_risk=cfg.capsule_risk,
+                  proximity_per_type=cfg.proximity_per_type,
+                  crosswalk_priority=cfg.crosswalk_priority,
                   **({'n_parked': cfg.n_parked} if cfg.hetero else {}))
     A, od, ad = cfg.num_agents, env.OBS_DIM, env.ACT_DIM
     net = ActorCritic(env.EGO_DIM, env.MAX_PARTNERS, env.PARTNER_FEATURES,

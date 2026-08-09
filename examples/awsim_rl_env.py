@@ -95,6 +95,20 @@ class AWSIMDrivingEnv:
     # step against a forward incentive of 0.095, and the 90th percentile is 25.
     OFFROAD_FIX = False
     OFFROAD_CAP = 1.0                # metres of overhang past which it costs no more
+    # The crossing risk put both agents at their centres with a radius of their half
+    # width, so a car's 4.97 m of length was invisible to it. See _proximity.
+    CAPSULE_RISK = False
+    # The proximity term took the worst partner over all of them, so a pedestrian
+    # stepping off a kerb was invisible behind the car in front: 48% of a vehicle's
+    # partners classify as crossing and 30% of those are pedestrians, but none of it
+    # reaches the reward while a same-lane leader scores higher. One worst partner *per
+    # type*, summed, keeps a pedestrian's risk from being hidden by a car's.
+    PROXIMITY_PER_TYPE = False
+    # `failtoyield` cannot fire for a pedestrian: the map's right_of_way elements only
+    # relate road lanelets, and the crosswalk conflict was left unmodelled on purpose.
+    # A crossing that a road lanelet passes through gives that road lanelet something to
+    # give way to.
+    CROSSWALK_PRIORITY = False
     MAX_PARTNERS = 16         # K nearest neighbours observed
     PARTNER_FEATURES = 8      # rel_x/y, width, length, rel_head_cos/sin, rel_speed, has_priority
     # 30 m was shorter than the braking distance of the faster agents: a motorcycle at
@@ -249,7 +263,13 @@ class AWSIMDrivingEnv:
                  w_collision_level=None, lat_accel_max=None,
                  w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
                  w_follow=None, branch_obs=None, despawn_at_goal=None,
-                 terminate_on_teleport=None, offroad_fix=None):
+                 terminate_on_teleport=None, offroad_fix=None, capsule_risk=None,
+                 proximity_per_type=None, crosswalk_priority=None):
+        self.capsule_risk = self.CAPSULE_RISK if capsule_risk is None else capsule_risk
+        self.proximity_per_type = (self.PROXIMITY_PER_TYPE if proximity_per_type is None
+                                   else proximity_per_type)
+        self.crosswalk_priority = (self.CROSSWALK_PRIORITY if crosswalk_priority is None
+                                   else crosswalk_priority)
         self.offroad_fix = self.OFFROAD_FIX if offroad_fix is None else offroad_fix
         self.terminate_on_teleport = (self.TERMINATE_ON_TELEPORT
                                       if terminate_on_teleport is None
@@ -422,6 +442,8 @@ class AWSIMDrivingEnv:
                             priority[order[y], order[pz]] = True
         if seen and not parsed:
             raise RuntimeError('right_of_way elements found but none parsed')
+        if self.crosswalk_priority:
+            parsed += self._add_crosswalk_priority(order, priority, yields)
         self._lanelet_order = order
         self._priority = priority
         self._yield_lanelet = yields
@@ -610,6 +632,48 @@ class AWSIMDrivingEnv:
         solid = moved & self._lane_solid[prev, lane]
         self._prev_lane, self._lane_valid = lane, torch.ones_like(self._lane_valid)
         return legal.float(), solid.float()
+
+    def _add_crosswalk_priority(self, order, priority, yields):
+        """Give a crossing right of way over the road lanelets that pass through it.
+
+        The map relates road lanelets to each other and says nothing about pedestrians,
+        so `failtoyield` could never fire for one - a car rolling through a crossing
+        with somebody on it broke no rule the reward could see. A road lanelet whose
+        centreline runs inside a crosswalk polygon is one that has to give way to it.
+        """
+        cross = [ll for ll in self.lanelet_map.laneletLayer
+                 if 'subtype' in ll.attributes and ll.attributes['subtype'] == 'crosswalk'
+                 and ll.id in order]
+        n = 0
+        for ll in self.lanelet_map.laneletLayer:
+            if ll.id not in order or 'subtype' not in ll.attributes:
+                continue
+            if ll.attributes['subtype'] != 'road':
+                continue
+            pts = [(q.x, q.y) for q in ll.centerline]
+            if len(pts) < 2:
+                continue
+            a = np.asarray(pts, dtype=np.float64)
+            # resample so a short crossing is not stepped over
+            cum = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(a, axis=0), axis=1))]
+            if cum[-1] < 1e-6:
+                continue
+            want = np.arange(0.0, cum[-1], 1.0)
+            xs = np.interp(want, cum, a[:, 0])
+            ys = np.interp(want, cum, a[:, 1])
+            hit = set()
+            for x, y in zip(xs, ys):
+                p = lanelet2.core.BasicPoint2d(float(x), float(y))
+                for dist, cw in lanelet2.geometry.findNearest(
+                        self.lanelet_map.laneletLayer, p, 8):
+                    if dist <= 0.01 and cw.id in order and cw.id != ll.id:
+                        if 'subtype' in cw.attributes and cw.attributes['subtype'] == 'crosswalk':
+                            hit.add(cw.id)
+            for cid in hit:
+                priority[order[ll.id], order[cid]] = True
+                yields[order[ll.id]] = True
+                n += 1
+        return n
 
     def _add_oncoming_turn_priority(self):
         """Make right-turning lanelets give way to the oncoming traffic they cross.
@@ -914,6 +978,17 @@ class AWSIMDrivingEnv:
         vel = torch.stack([c, sn], dim=-1) * v.unsqueeze(-1)
         w = vel.unsqueeze(0) - vel.unsqueeze(1)
         R = half_w.unsqueeze(0) + half_w.unsqueeze(1) + self.PROXIMITY_MARGIN
+        if self.capsule_risk:
+            # Measure from the nearest point of the ego's body, not its centre. Both
+            # agents were discs of their half *width*, which turns a 4.97 m car into a
+            # 1.02 m circle: a pedestrian stepping out two metres in front of the bumper
+            # is 4.5 m from that circle, so the time-to-contact is computed to a point
+            # the car reaches long after it has already hit them. The body is a capsule
+            # of its own length instead - the same radius, slid along the centre line.
+            s_ego = dx.clamp(-half_l.unsqueeze(1), half_l.unsqueeze(1))
+            nose = torch.stack([s_ego * c.unsqueeze(1) - 0.0 * sn.unsqueeze(1),
+                                s_ego * sn.unsqueeze(1)], dim=-1)
+            rel = rel - nose
         qa = (w * w).sum(-1)
         qb = 2.0 * (rel * w).sum(-1)
         qc = (rel * rel).sum(-1) - R * R
@@ -928,7 +1003,14 @@ class AWSIMDrivingEnv:
         eye = torch.eye(A, dtype=torch.bool, device=self.device)
         mask = self.simulator.get_present_mask()[0]
         risk = torch.where(eye | ~mask.unsqueeze(0), torch.zeros_like(risk), risk)
-        return risk.max(dim=1).values * mask
+        if not self.proximity_per_type:
+            return risk.max(dim=1).values * mask
+        kinds = self._agent_types()
+        worst = torch.zeros(A, device=self.device)
+        for t in range(self.NUM_TYPES):
+            worst = worst + torch.where(kinds.unsqueeze(0) == t, risk,
+                                        torch.zeros_like(risk)).max(dim=1).values
+        return worst * mask
 
     def _same_corridor(self, lane):
         """[A, A] mask of agent pairs travelling the same stretch of road.

@@ -95,7 +95,13 @@ class AWSIMHeteroDrivingEnv(AWSIMDrivingEnv):
                  w_collision_level=None, lat_accel_max=None,
                  w_lanechange=None, w_solidcross=None, max_steer_scale=1.0,
                  goal_dist_scale=1.0, w_follow=None, branch_obs=None,
-                 despawn_at_goal=None, terminate_on_teleport=None, offroad_fix=None):
+                 despawn_at_goal=None, terminate_on_teleport=None, offroad_fix=None,
+                 capsule_risk=None, proximity_per_type=None, crosswalk_priority=None):
+        self.capsule_risk = self.CAPSULE_RISK if capsule_risk is None else capsule_risk
+        self.proximity_per_type = (self.PROXIMITY_PER_TYPE if proximity_per_type is None
+                                   else proximity_per_type)
+        self.crosswalk_priority = (self.CROSSWALK_PRIORITY if crosswalk_priority is None
+                                   else crosswalk_priority)
         self.offroad_fix = self.OFFROAD_FIX if offroad_fix is None else offroad_fix
         self.terminate_on_teleport = (self.TERMINATE_ON_TELEPORT
                                       if terminate_on_teleport is None
